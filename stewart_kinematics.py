@@ -18,7 +18,7 @@ R_PLATFORM = 135.0                 # r: centre of platform to each support point
 L_BASE = [50.0, 50.0, 50.0]        # l_1, l_2, l_3:     centre of base to each motor axis
 L_LINK_1 = [80.0, 80.0, 80.0]      # l_11, l_21, l_31:  motor-driven links
 L_LINK_2 = [94.0, 94.0, 94.0]      # l_12, l_22, l_32:  passive links to the platform
-X0 = np.array([0.0, 0.0, 94.0])    # platform centre, kept fixed for now
+X0 = np.array([0.0, 0.0, 105.0])    # platform centre, kept fixed for now
 
 # Direction of each actuator in the x-y plane: actuator 1 on +y, 2 at -30 deg, 3 at 210 deg.
 ACTUATOR_ANGLES = [90.0, -30.0, 210.0]
