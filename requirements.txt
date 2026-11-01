@@ -1,3 +1,4 @@
 numpy>=1.26
 matplotlib>=3.9      # also installs pillow, used for the GIF export
 pyserial>=3.5        # motor_control.py (talks to the Arduino motor shield)
+opencv-python>=4.8   # cv2: ball_detection.py, simple_cal.py, basic_controller.py
