@@ -6,12 +6,15 @@ import cv2
 import numpy as np
 import json
 import os
+import time
 
 DISPLAY_SIZE = 480  # side of the square preview window in pixels (smaller number = zoomed out more)
 
-# Ask the camera for its widest 16:9 mode (4:3 modes are often cropped from it), then shrink every
-# frame to PROCESS_SIZE. Keep the width at 640 so pixel_to_meter_ratio and the radius filter keep their scale.
-CAPTURE_SIZE = (1280, 720)
+# Capture 16:9 at 640x360. Measured on this webcam: 30 fps at 640x360 and 640x480, but only 20 fps at
+# 960x540 and 10 fps at 1280x720 (too slow to balance a ball), so do not raise this without re-measuring.
+# Every frame is resized to PROCESS_SIZE (a no-op while the two match) so pixel_to_meter_ratio and the
+# radius filter keep their scale.
+CAPTURE_SIZE = (640, 360)
 PROCESS_SIZE = (640, 360)
 
 def fit_square(frame, size=DISPLAY_SIZE):
@@ -124,6 +127,7 @@ class BallDetector:
         normalized_x = (x - center_x) / center_x  # Normalize to -1 to +1 range
         position_m = normalized_x * self.scale_factor  # Convert to meters
         
+        self.last_center_subpixel = (x, y)  # unrounded centre, used for the Stewart platform position
         return True, (int(x), int(y)), radius, position_m
 
     def draw_detection(self, frame, show_info=True):
@@ -180,8 +184,9 @@ class BallDetector:
         found, center, radius, _ = self.detect_ball(frame)
         if not found or self.plate_center_px is None or not self.meters_per_pixel:
             return False, None, center, radius
-        x_m = (center[0] - self.plate_center_px[0]) * self.meters_per_pixel
-        y_m = (self.plate_center_px[1] - center[1]) * self.meters_per_pixel
+        sub_x, sub_y = self.last_center_subpixel
+        x_m = (sub_x - self.plate_center_px[0]) * self.meters_per_pixel
+        y_m = (self.plate_center_px[1] - sub_y) * self.meters_per_pixel
         return True, (x_m, y_m), center, radius
 
     def draw_detection_xy(self, frame):
@@ -205,6 +210,119 @@ class BallDetector:
             cv2.putText(overlay, f"x: {position_m[0] * 1000:.1f}  y: {position_m[1] * 1000:.1f} mm",
                        (center[0] - 60, center[1] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         return overlay, found, position_m
+
+class BallTracker:
+    """Stewart platform: ball position (m from the plate centre) and velocity (m/s) over time.
+
+    Uses an alpha-beta filter. Each frame it
+        1. predicts where the ball should be:   predicted = position + velocity * dt
+        2. compares that with the camera:       error = measured - predicted
+        3. corrects:                            position += alpha * error
+                                                velocity += (beta / dt) * error
+    so position and velocity are smoothed together and a missed frame is covered by the prediction.
+    +x is right and +y is up in the image, same as BallDetector.detect_ball_xy.
+    """
+
+    def __init__(self, detector=None, alpha=0.5, beta=None, max_gap_s=0.3):
+        """
+        Args:
+            detector: BallDetector to use (default: one built from config.json)
+            alpha (float): 0..1, how much of the position error is corrected each frame.
+                Larger trusts the camera more (less lag, more noise).
+            beta (float): how much of the error goes into the velocity.
+                Default alpha^2 / (2 - alpha), a standard well-behaved pairing for alpha.
+            max_gap_s (float): if the ball was lost for longer than this, tracking restarts
+        """
+        self.detector = detector or BallDetector()
+        self.alpha = alpha
+        self.beta = beta if beta is not None else alpha ** 2 / (2 - alpha)
+        self.max_gap_s = max_gap_s
+        self.reset()
+
+    def reset(self):
+        """Forget the previous position and velocity."""
+        self.position = None  # filtered (x, y) in meters, None until the ball is first seen
+        self.velocity = np.zeros(2)  # filtered (vx, vy) in m/s
+        self.raw_position_m = None  # unfiltered camera measurement of the last found frame
+        self.last_time = None
+        self.found = False
+        self.center_px = None
+        self.radius_px = None
+
+    @property
+    def position_m(self):
+        return None if self.position is None else (float(self.position[0]), float(self.position[1]))
+
+    @property
+    def velocity_mps(self):
+        return (float(self.velocity[0]), float(self.velocity[1]))
+
+    def update(self, frame, timestamp=None):
+        """Detect the ball in this frame and update the filter.
+
+        Args:
+            frame: Input BGR image frame
+            timestamp (float): time the frame was captured in seconds (default: now)
+
+        Returns:
+            found (bool): True if the ball was detected
+            position_m (tuple): filtered (x, y) in meters from the plate centre, or None
+            velocity_mps (tuple): filtered (vx, vy) in m/s ((0, 0) if the ball is not found)
+        """
+        now = time.time() if timestamp is None else timestamp
+        self.found, measured, self.center_px, self.radius_px = self.detector.detect_ball_xy(frame)
+
+        if not self.found:
+            return False, None, (0.0, 0.0)
+
+        measured = np.array(measured)
+        self.raw_position_m = tuple(measured)
+
+        dt = None if self.last_time is None else now - self.last_time
+        if self.position is None or dt is None or not (0 < dt <= self.max_gap_s):
+            # First sighting (or lost for too long): start from the measurement with zero velocity
+            self.position = measured
+            self.velocity = np.zeros(2)
+        else:
+            predicted = self.position + self.velocity * dt  # 1. predict
+            error = measured - predicted                    # 2. compare with the camera
+            self.position = predicted + self.alpha * error  # 3. correct position...
+            self.velocity = self.velocity + (self.beta / dt) * error  # ...and velocity
+
+        self.last_time = now
+        return True, self.position_m, self.velocity_mps
+
+    def draw(self, frame, arrow_seconds=0.3):
+        """Draw the last update on the frame: plate centre, ball, position, velocity and an arrow.
+
+        The arrow shows where the ball would be after arrow_seconds at its current velocity.
+        """
+        overlay = frame.copy()
+
+        # Plate centre crosshair
+        if self.detector.plate_center_px is not None:
+            cx, cy = int(self.detector.plate_center_px[0]), int(self.detector.plate_center_px[1])
+            cv2.line(overlay, (cx - 15, cy), (cx + 15, cy), (255, 255, 255), 1)
+            cv2.line(overlay, (cx, cy - 15), (cx, cy + 15), (255, 255, 255), 1)
+
+        if self.found:
+            center = self.center_px
+            vx, vy = self.velocity_mps
+            x, y = self.position_m
+            cv2.circle(overlay, center, int(self.radius_px), (0, 255, 0), 2)
+            cv2.circle(overlay, center, 3, (0, 255, 0), -1)
+
+            # Velocity arrow (image y points down, so flip vy)
+            pixels_per_meter = 1.0 / self.detector.meters_per_pixel
+            tip = (int(center[0] + vx * arrow_seconds * pixels_per_meter),
+                   int(center[1] - vy * arrow_seconds * pixels_per_meter))
+            cv2.arrowedLine(overlay, center, tip, (0, 0, 255), 2, tipLength=0.3)
+
+            cv2.putText(overlay, f"x: {x * 1000:.1f}  y: {y * 1000:.1f} mm",
+                       (center[0] - 60, center[1] - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(overlay, f"vx: {vx * 1000:.0f}  vy: {vy * 1000:.0f} mm/s",
+                       (center[0] - 60, center[1] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        return overlay
 
 # Legacy function for backward compatibility with existing code
 def detect_ball_x(frame):
@@ -240,6 +358,7 @@ def detect_ball_x(frame):
 def main():
     """Test ball detection with current config."""
     detector = BallDetector()
+    tracker = BallTracker(detector)
     cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use default camera
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
@@ -258,10 +377,12 @@ def main():
         
         # Get detection results with overlay
         if detector.plate_center_px is not None:
-            # Stewart platform calibration found: 2D position on the plate
-            vis_frame, found, position_m = detector.draw_detection_xy(frame)
+            # Stewart platform calibration found: 2D position and velocity on the plate
+            found, position_m, velocity_mps = tracker.update(frame)
+            vis_frame = tracker.draw(frame)
             if found:
-                print(f"Ball at x={position_m[0] * 1000:.1f} mm, y={position_m[1] * 1000:.1f} mm from plate centre")
+                print(f"Ball at x={position_m[0] * 1000:.1f} mm, y={position_m[1] * 1000:.1f} mm  |  "
+                      f"vx={velocity_mps[0] * 1000:.0f} mm/s, vy={velocity_mps[1] * 1000:.0f} mm/s")
         else:
             vis_frame, found, position_m = detector.draw_detection(frame)
             if found:
