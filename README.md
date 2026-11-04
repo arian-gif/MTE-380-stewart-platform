@@ -15,8 +15,8 @@ pip install -r requirements.txt
 | `python stewart_kinematics.py` | Prints motor angles for a few tilts, with a forward-kinematics check |
 | `python stewart_animation.py` | Writes `static_configs.png`, `animation_frames.png`, `stewart_animation.gif` |
 | `python platform_control.py --dry-run` | Type `alpha beta` (deg, 80..100, level = 90 90); computes and sends all 3 motor angles (use `--port COMx` on hardware) |
-| `python simple_cal.py` | Camera calibration for the plate: click the ball, then the plate centre and edge, press `s` to save `config.json` (`l` levels the platform) |
-| `python ball_detection.py` | Live test of ball tracking; shows the ball's x, y (mm from the plate centre) and velocity (mm/s) once calibrated |
+| `python simple_cal.py` | Camera calibration for the plate: click the ball and press `c`, size the circle with `+`/`-` (`[`/`]` big steps) and move the plate to fit it, press `g`, then `s` to save `config.json` (`l` levels the platform, `r` redoes the circle) |
+| `python ball_detection.py` | Live test of ball tracking; shows the ball's x, y (mm from the plate centre) and velocity (mm/s) once calibrated; press `q` to save `ball_track_<date>.csv` + `.png` and show position-time and velocity-time graphs |
 | `python motor_control.py 1 90 --dry-run` | Shows the command that would be sent to motor 1 (no hardware) |
 | `python motor_control.py 1 90 --port COMx` | Moves motor 1 to 90 deg |
 

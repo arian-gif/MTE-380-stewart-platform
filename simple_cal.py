@@ -2,9 +2,10 @@
 # Interactive tool for ball colour and plate geometry. Writes config.json for ball_detection.py.
 #
 # Phase 1: click the ball to sample its colour, press 'c'
-# Phase 2: click the plate centre, then a point on the plate edge (PLATE_RADIUS_M from the centre)
+# Phase 2: a circle is drawn at the centre of the view. Size it with '+' / '-' ('[' / ']' for big steps),
+#          move the real platform until its edge fits the circle, then press 'g'
 # Then press 's' to save. Press 'l' any time to send the platform to level (alpha = beta = 90) and
-# check the servos, 'r' to redo the plate clicks, 'q' to quit.
+# check the servos, 'r' to redo the circle, 'q' to quit.
 
 import cv2
 import numpy as np
@@ -16,7 +17,7 @@ import motor_control
 import platform_control
 from ball_detection import fit_square, CAPTURE_SIZE, PROCESS_SIZE
 
-# Distance from the plate centre to the edge point you click in phase 2 (notes: r = 135 mm).
+# Radius of the real plate, the size the phase 2 circle stands for (notes: r = 135 mm).
 # TODO: measure on the real platform.
 PLATE_RADIUS_M = 0.135
 
@@ -41,9 +42,10 @@ class StewartCalibrator:
         self.upper_hsv = None  # Upper HSV bound for ball detection
         self.ball_radius_px = None  # Ball radius seen when the colour phase ended
 
-        # Geometry calibration data
-        self.plate_points = []  # Clicked pixels: plate centre, then a point on the plate edge
-        self.plate_center_px = None  # Plate centre in the frame (pixels)
+        # Geometry calibration data: a circle at the centre of the view that the plate is fitted to
+        self.circle_center_px = (self.FRAME_W // 2, self.FRAME_H // 2)
+        self.circle_radius_px = int(min(self.FRAME_W, self.FRAME_H) * 0.4)  # starting size
+        self.plate_center_px = None  # Plate centre in the frame (pixels), set when you press 'g'
         self.pixel_to_meter_ratio = None  # Meters per pixel at the plate
 
         # Platform connection (Arduino with the servo shield), optional
@@ -97,13 +99,6 @@ class StewartCalibrator:
             if self.phase == "color":
                 # Color sampling phase - collect HSV samples at click point
                 self.sample_color(x, y)
-            elif self.phase == "geometry" and len(self.plate_points) < 2:
-                # Geometry phase - plate centre first, then a point on the plate edge
-                self.plate_points.append((x, y))
-                names = ["centre", "edge"]
-                print(f"[GEO] Plate {names[len(self.plate_points) - 1]} selected")
-                if len(self.plate_points) == 2:
-                    self.calculate_geometry()
 
     def sample_color(self, x, y):
         """Sample HSV color values in a 5x5 region around click point.
@@ -150,22 +145,17 @@ class StewartCalibrator:
 
             print(f"[COLOR] Samples: {len(self.hsv_samples)}")
 
-    def calculate_geometry(self):
-        """Work out the plate centre and meters-per-pixel from the two clicked points."""
-        center, edge = self.plate_points
+    def resize_circle(self, delta):
+        """Grow or shrink the geometry circle by delta pixels (kept inside the frame height)."""
+        limit = self.FRAME_H // 2
+        self.circle_radius_px = int(np.clip(self.circle_radius_px + delta, 10, limit))
 
-        # Pixel distance from the plate centre to the edge point
-        pixel_distance = math.sqrt((edge[0] - center[0])**2 + (edge[1] - center[1])**2)
-        if pixel_distance < 1:
-            print("[GEO] The two points are the same - click again")
-            self.plate_points = []
-            return
-
-        # Convert to meters using the known plate radius
-        self.plate_center_px = center
-        self.pixel_to_meter_ratio = PLATE_RADIUS_M / pixel_distance
-        print(f"[GEO] Plate centre: {center}, meters per pixel: {self.pixel_to_meter_ratio:.6f}")
-
+    def confirm_geometry(self):
+        """The plate now fits the circle: take the circle as the plate and work out meters-per-pixel."""
+        self.plate_center_px = self.circle_center_px
+        self.pixel_to_meter_ratio = PLATE_RADIUS_M / self.circle_radius_px
+        print(f"[GEO] Plate centre: {self.plate_center_px}, radius {self.circle_radius_px} px, "
+              f"meters per pixel: {self.pixel_to_meter_ratio:.6f}")
         self.phase = "complete"
 
     def find_ball(self, frame):
@@ -252,7 +242,7 @@ class StewartCalibrator:
         # Phase-specific instruction text
         phase_text = {
             "color": "Click on the ball to sample its colour. Press 'c' when done.",
-            "geometry": "Click the plate centre, then a point on the plate edge",
+            "geometry": "Move the plate to fit the circle. +/- size ([ ] big steps), 'g' when it fits",
             "complete": "Calibration complete! Press 's' to save"
         }
 
@@ -267,11 +257,12 @@ class StewartCalibrator:
             cv2.putText(overlay, f"Color samples: {len(self.hsv_samples)}", (10, 90),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # Show the clicked plate points
-        for i, point in enumerate(self.plate_points):
-            cv2.circle(overlay, point, 6, (0, 255, 0), -1)
-            cv2.putText(overlay, ["Centre", "Edge"][i], (point[0] + 10, point[1] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # Geometry phase: the circle the plate is fitted to
+        if self.phase == "geometry":
+            cv2.circle(overlay, self.circle_center_px, self.circle_radius_px, (0, 255, 0), 2)
+            cv2.drawMarker(overlay, self.circle_center_px, (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
+            cv2.putText(overlay, f"Circle radius: {self.circle_radius_px} px = {PLATE_RADIUS_M * 1000:.0f} mm",
+                       (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
         # Draw the plate outline once the geometry is known
         if self.plate_center_px:
@@ -316,8 +307,8 @@ class StewartCalibrator:
         # Display instructions
         print("[INFO] Stewart Platform Calibration")
         print("Phase 1: Click on the ball to sample its colour, press 'c' when done")
-        print("Phase 2: Click the plate centre, then a point on the plate edge")
-        print("Press 'l' to level the platform, 'r' to redo the plate clicks, 's' to save, 'q' to quit")
+        print("Phase 2: Size the circle with + / - ([ ] for big steps), move the platform to fit it, press 'g'")
+        print("Press 'l' to level the platform, 'r' to redo the circle, 's' to save, 'q' to quit")
 
         # Main calibration loop
         while True:
@@ -345,14 +336,24 @@ class StewartCalibrator:
                     if ball:
                         self.ball_radius_px = ball[2]
                     self.phase = "geometry"
-                    print("[INFO] Color calibration complete. Click the plate centre, then a point on the edge.")
+                    print("[INFO] Color calibration complete. Fit the circle to the plate and press 'g'.")
             elif key == ord('r') and self.phase in ("geometry", "complete"):
-                # Redo the plate clicks
-                self.plate_points = []
+                # Redo the circle
                 self.plate_center_px = None
                 self.pixel_to_meter_ratio = None
                 self.phase = "geometry"
-                print("[INFO] Click the plate centre, then a point on the edge.")
+                print("[INFO] Fit the circle to the plate and press 'g'.")
+            elif self.phase == "geometry" and key in (ord('+'), ord('=')):
+                self.resize_circle(2)
+            elif self.phase == "geometry" and key in (ord('-'), ord('_')):
+                self.resize_circle(-2)
+            elif self.phase == "geometry" and key == ord(']'):
+                self.resize_circle(10)
+            elif self.phase == "geometry" and key == ord('['):
+                self.resize_circle(-10)
+            elif key == ord('g') and self.phase == "geometry":
+                # The plate fits the circle
+                self.confirm_geometry()
             elif key == ord('l'):
                 # Send the platform to level
                 self.level_platform()

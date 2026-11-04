@@ -4,9 +4,11 @@
 
 import cv2
 import numpy as np
+import csv
 import json
 import os
 import time
+from datetime import datetime
 
 DISPLAY_SIZE = 480  # side of the square preview window in pixels (smaller number = zoomed out more)
 
@@ -354,17 +356,93 @@ def detect_ball_x(frame):
     
     return found, x_normalized, vis_frame
 
+class TrackLog:
+    """Records the ball's position and velocity over time, then saves a CSV and plots it.
+
+    Units in the file and on the plots are mm and mm/s, measured from the plate centre
+    (+x right, +y up in the image). Frames where the ball was not found are logged as blanks,
+    so the plot shows a gap there.
+    """
+
+    COLUMNS = ["time_s", "found", "x_mm", "y_mm", "vx_mm_s", "vy_mm_s", "raw_x_mm", "raw_y_mm"]
+
+    def __init__(self):
+        self.start_time = None
+        self.rows = []
+
+    def add(self, timestamp, found, position_m, velocity_mps, raw_position_m):
+        """Record one frame. position_m / velocity_mps are the filtered values from BallTracker."""
+        if self.start_time is None:
+            self.start_time = timestamp
+        t = timestamp - self.start_time
+        if found:
+            self.rows.append([t, 1,
+                              position_m[0] * 1000, position_m[1] * 1000,
+                              velocity_mps[0] * 1000, velocity_mps[1] * 1000,
+                              raw_position_m[0] * 1000, raw_position_m[1] * 1000])
+        else:
+            self.rows.append([t, 0] + [float("nan")] * 6)
+
+    def save_csv(self, path=None):
+        """Write the log to a CSV file (default name has the date and time). Returns the path."""
+        if path is None:
+            path = f"ball_track_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.COLUMNS)
+            for row in self.rows:
+                # Blank cells (not "nan") for frames where the ball was not found
+                writer.writerow([f"{row[0]:.4f}", int(row[1])] + [f"{v:.4f}" if v == v else "" for v in row[2:]])
+        return path
+
+    def plot(self, csv_path=None, show=True):
+        """Draw position-time and velocity-time graphs. Saved as a PNG next to the CSV if one is given."""
+        import matplotlib.pyplot as plt  # imported here so the detector works without matplotlib
+
+        data = np.array(self.rows, dtype=float)
+        t = data[:, 0]
+        fig, (ax_pos, ax_vel) = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+        # Position vs time: filtered (solid) and the raw camera measurement (faint)
+        ax_pos.plot(t, data[:, 6], color="tab:blue", alpha=0.3, label="x raw")
+        ax_pos.plot(t, data[:, 7], color="tab:orange", alpha=0.3, label="y raw")
+        ax_pos.plot(t, data[:, 2], color="tab:blue", label="x")
+        ax_pos.plot(t, data[:, 3], color="tab:orange", label="y")
+        ax_pos.set_ylabel("Position (mm)")
+        ax_pos.set_title("Ball position vs time (from plate centre)")
+
+        # Velocity vs time
+        ax_vel.plot(t, data[:, 4], color="tab:blue", label="vx")
+        ax_vel.plot(t, data[:, 5], color="tab:orange", label="vy")
+        ax_vel.set_ylabel("Velocity (mm/s)")
+        ax_vel.set_xlabel("Time (s)")
+        ax_vel.set_title("Ball velocity vs time")
+
+        for ax in (ax_pos, ax_vel):
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper right")
+        fig.tight_layout()
+
+        if csv_path:
+            png_path = os.path.splitext(csv_path)[0] + ".png"
+            fig.savefig(png_path, dpi=120)
+            print(f"Saved plot to {png_path}")
+        if show:
+            plt.show()
+        plt.close(fig)
+
 # For testing/calibration when run directly
 def main():
     """Test ball detection with current config."""
     detector = BallDetector()
     tracker = BallTracker(detector)
+    log = TrackLog()  # position and velocity over time, saved when you quit
     cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)  # Use default camera
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
     
     print("Ball Detection Test")
-    print("Press 'q' to quit")
+    print("Press 'q' to quit (saves a CSV and shows position/velocity graphs)")
     
     while True:
         ret, frame = cap.read()
@@ -378,7 +456,9 @@ def main():
         # Get detection results with overlay
         if detector.plate_center_px is not None:
             # Stewart platform calibration found: 2D position and velocity on the plate
-            found, position_m, velocity_mps = tracker.update(frame)
+            now = time.time()
+            found, position_m, velocity_mps = tracker.update(frame, now)
+            log.add(now, found, position_m, velocity_mps, tracker.raw_position_m)
             vis_frame = tracker.draw(frame)
             if found:
                 print(f"Ball at x={position_m[0] * 1000:.1f} mm, y={position_m[1] * 1000:.1f} mm  |  "
@@ -398,6 +478,14 @@ def main():
     # Clean up resources
     cap.release()
     cv2.destroyAllWindows()
+    
+    # Save the recorded track and plot it
+    if log.rows:
+        csv_path = log.save_csv()
+        print(f"Saved {len(log.rows)} samples to {csv_path}")
+        log.plot(csv_path)
+    else:
+        print("Nothing recorded: no plate calibration found. Run simple_cal.py first.")
 
 if __name__ == "__main__":
     main()

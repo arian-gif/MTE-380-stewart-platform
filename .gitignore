@@ -4,6 +4,7 @@
 *.png
 *.gif
 .claude
+*.csv
 
 # Python
 __pycache__/
