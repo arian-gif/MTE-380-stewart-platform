@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-11-04T17:47:56.228014",
+  "plate_radius_m": 0.135,
+  "camera": {
+    "index": 1,
+    "frame_width": 640,
+    "frame_height": 360
+  },
+  "ball_detection": {
+    "lower_hsv": [
+      8.0,
+      142.3,
+      142.9
+    ],
+    "upper_hsv": [
+      25.0,
+      255.0,
+      255.0
+    ],
+    "min_radius_px": 11.45281982421875,
+    "max_radius_px": 34.35845947265625
+  },
+  "calibration": {
+    "pixel_to_meter_ratio": 0.0007848837209302326,
+    "plate_center_px": [
+      320,
+      180
+    ]
+  },
+  "platform": {
+    "port": "COM5",
+    "level_alpha": 90.0,
+    "level_beta": 90.0
+  }
+}

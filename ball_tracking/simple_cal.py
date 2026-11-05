@@ -11,11 +11,16 @@ import cv2
 import numpy as np
 import json
 import math
+import os
+import sys
 from datetime import datetime
+
+# motor_control.py and platform_control.py live in the parent folder
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import motor_control
 import platform_control
-from ball_detection import fit_square, CAPTURE_SIZE, PROCESS_SIZE
+from ball_detection import fit_square, CAPTURE_SIZE, PROCESS_SIZE, CONFIG_PATH
 
 # Radius of the real plate, the size the phase 2 circle stands for (notes: r = 135 mm).
 # TODO: measure on the real platform.
@@ -224,9 +229,9 @@ class StewartCalibrator:
         }
 
         # Write configuration to JSON file
-        with open("config.json", "w") as f:
+        with open(CONFIG_PATH, "w") as f:
             json.dump(config, f, indent=2)
-        print("[SAVE] Configuration saved to config.json")
+        print(f"[SAVE] Configuration saved to {CONFIG_PATH}")
 
     def draw_overlay(self, frame):
         """Draw calibration status and instructions overlay on frame.

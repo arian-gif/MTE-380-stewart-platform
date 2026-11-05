@@ -10,6 +10,11 @@ import os
 import time
 from datetime import datetime
 
+# Files live next to this script, so everything works no matter which folder you run it from
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(HERE, "config.json")  # written by simple_cal.py
+TRACKS_DIR = os.path.join(HERE, "tracks")  # CSVs and plots saved when you quit ball_detection.py
+
 DISPLAY_SIZE = 480  # side of the square preview window in pixels (smaller number = zoomed out more)
 
 # Capture 16:9 at 640x360. Measured on this webcam: 30 fps at 640x360 and 640x480, but only 20 fps at
@@ -38,7 +43,7 @@ def fit_square(frame, size=DISPLAY_SIZE):
 class BallDetector:
     """Computer vision ball detector using HSV color space filtering."""
     
-    def __init__(self, config_file="config.json"):
+    def __init__(self, config_file=CONFIG_PATH):
         """Initialize ball detector with HSV bounds from config file.
         
         Args:
@@ -386,7 +391,8 @@ class TrackLog:
     def save_csv(self, path=None):
         """Write the log to a CSV file (default name has the date and time). Returns the path."""
         if path is None:
-            path = f"ball_track_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            os.makedirs(TRACKS_DIR, exist_ok=True)
+            path = os.path.join(TRACKS_DIR, f"ball_track_{datetime.now():%Y%m%d_%H%M%S}.csv")
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(self.COLUMNS)
