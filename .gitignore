@@ -5,6 +5,8 @@
 *.gif
 .claude
 *.csv
+*.pptx
+deck_work/
 
 # Python
 __pycache__/
