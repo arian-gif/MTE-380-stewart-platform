@@ -32,6 +32,8 @@ import motor_control
 import platform_control
 from ball_detection import (BallDetector, BallTracker, CAPTURE_SIZE, PROCESS_SIZE,
                             CONFIG_PATH, HERE, fit_square)
+from pid import AxisPID
+from trajectory import make_planner, tilt_for_acceleration
 
 LEVEL_ALPHA, LEVEL_BETA = 90.0, 90.0   # platform angles for a level plate
 MAX_TILT_DEG = 10.0                    # the platform accepts alpha and beta within 90 +/- 10
@@ -47,42 +49,13 @@ CSV_DIR = os.path.join(RUNS_DIR, "csv")        # the logged values of each run, 
 PLOTS_DIR = os.path.join(RUNS_DIR, "plots")    # the matplotlib plot of each run, one PNG per run
 
 
-class AxisPID:
-    """PID controller for one axis: error in cm, output is a tilt in degrees.
-
-    The D term uses the ball's measured velocity. With a fixed setpoint, d(error)/dt = -velocity,
-    so there is no need to difference noisy positions, and it does not jump when you move the setpoint.
-    """
-
-    def __init__(self, limit_deg=MAX_TILT_DEG):
-        self.limit = limit_deg
-        self.integral = 0.0   # cm * s
-
-    def reset(self):
-        self.integral = 0.0
-
-    def update(self, kp, ki, kd, setpoint, position, velocity, dt):
-        error = setpoint - position
-        p = kp * error
-        d = -kd * velocity
-
-        # Anti-windup: stop adding to the integral while the output is pinned at the limit
-        # and the error would push it further
-        unsaturated = p + ki * self.integral + d
-        if abs(unsaturated) < self.limit or unsaturated * error < 0:
-            self.integral += error * dt
-        if ki > 1e-6:
-            cap = self.limit / ki   # the integral term alone can never exceed the limit
-            self.integral = float(np.clip(self.integral, -cap, cap))
-
-        output = p + ki * self.integral + d
-        return float(np.clip(output, -self.limit, self.limit))
-
-
 class StewartBallController:
     # Columns of the run log / CSV
     COLUMNS = ["time_s", "found", "x_cm", "y_cm", "vx_cm_s", "vy_cm_s", "setpoint_x_cm", "setpoint_y_cm",
-               "tilt_x_deg", "tilt_y_deg", "alpha_deg", "beta_deg", "enabled", "kp", "ki", "kd"]
+               "reference_x_cm", "reference_y_cm", "reference_vx_cm_s", "reference_vy_cm_s",
+               "tilt_x_deg", "tilt_y_deg", "alpha_deg", "beta_deg", "enabled", "kp", "ki", "kd",
+               "method", "feedforward", "duration_s", "replan_interval_s"]
+    METHOD_LABELS = {"step": "Step", "trajectory": "Trajectory", "update": "Trajectory + replanning"}
 
     def __init__(self, link, config_file=CONFIG_PATH):
         """Load the calibration and set defaults. link is a motor_control.MotorLink."""
@@ -98,11 +71,22 @@ class StewartBallController:
 
         # PID gains (set by the sliders). Starting point from the ball's physics: a rolling ball
         # accelerates about 12 cm/s^2 per degree of tilt; tune on the real platform from here.
-        self.Kp = 0.75
-        self.Ki = 0.0
+        self.Kp = 0.3
+        self.Ki = 0.05
         self.Kd = 0.35
         self.setpoint = [0.0, 0.0]               # cm from the plate centre
         self.pid = [AxisPID(), AxisPID()]        # x axis, y axis
+
+        # How the ball is moved to the setpoint (see trajectory.py):
+        #   "step"        the PID aims straight at the setpoint
+        #   "trajectory"  a smooth path to the setpoint is planned when the move starts and the PID follows it
+        #   "update"      the same, replanned from the measured ball state every replan_interval seconds
+        self.method = "step"
+        self.duration = 3.0                      # s, planned length of a move (trajectory methods)
+        self.replan_interval = 0.5               # s, how often the path is replanned ("update")
+        self.feedforward = 0.0                   # 0 = PID only, 1 = also tilt for the planned acceleration
+        self.planner = make_planner(self.method, duration=self.duration, replan_interval=self.replan_interval)
+        self.reference = None                    # (position, velocity) the PID is aiming at, None when not controlling
 
         # Controller state
         self.enabled = False                     # control is off until you tick the box
@@ -131,9 +115,11 @@ class StewartBallController:
         self.tilt = (tilt_x, tilt_y)
 
     def level(self):
-        """Bring the plate level and clear the PID memory. Only sends if it is not already level."""
+        """Bring the plate level and clear the PID memory and the current move. Only sends if not already level."""
         for pid in self.pid:
             pid.reset()
+        self.planner.reset()         # the next move starts from wherever the ball is
+        self.reference = None
         self.last_control_time = None
         if self.tilt != (0.0, 0.0):
             self.send_tilt(0.0, 0.0)
@@ -167,9 +153,17 @@ class StewartBallController:
                 pid.reset()
             dt = 1 / 30
 
-        tilt = [self.pid[axis].update(self.Kp, self.Ki, self.Kd, self.setpoint[axis],
-                                      position_cm[axis], velocity_cm_s[axis], dt)
+        # Where should the ball be now? The planner decides (for the step method it is just the setpoint)
+        reference_position, reference_velocity = self.planner.reference(t, position_cm, velocity_cm_s, self.setpoint)
+        self.reference = (reference_position, reference_velocity)
+
+        tilt = [self.pid[axis].update(self.Kp, self.Ki, self.Kd, reference_position[axis],
+                                      position_cm[axis], velocity_cm_s[axis], dt, reference_velocity[axis])
                 for axis in range(2)]
+        if self.feedforward:
+            # Add the tilt that gives the ball the planned acceleration (zero for the step method)
+            extra = self.feedforward * tilt_for_acceleration(self.planner.acceleration(t))
+            tilt = [float(np.clip(tilt[axis] + extra[axis], -MAX_TILT_DEG, MAX_TILT_DEG)) for axis in range(2)]
         self.send_tilt(*tilt)
         self.status = "CONTROLLING"
         return tuple(tilt)
@@ -179,10 +173,22 @@ class StewartBallController:
         nan = float("nan")
         x, y = position_cm if found else (nan, nan)
         vx, vy = velocity_cm_s if found else (nan, nan)
+        if self.reference is not None:
+            (ref_x, ref_y), (ref_vx, ref_vy) = self.reference
+        else:
+            ref_x = ref_y = ref_vx = ref_vy = nan
         alpha = LEVEL_ALPHA - TILT_SIGN_X * tilt[0]
         beta = LEVEL_BETA - TILT_SIGN_Y * tilt[1]
         self.log.append([t - self.start_time, int(found), x, y, vx, vy, self.setpoint[0], self.setpoint[1],
-                         tilt[0], tilt[1], alpha, beta, int(self.enabled), self.Kp, self.Ki, self.Kd])
+                         ref_x, ref_y, ref_vx, ref_vy, tilt[0], tilt[1], alpha, beta, int(self.enabled),
+                         self.Kp, self.Ki, self.Kd, self.method, self.feedforward, self.duration,
+                         self.replan_interval])
+
+    def set_method(self, method):
+        """Switch between "step", "trajectory" and "update". The next move starts fresh."""
+        self.method = method
+        self.planner = make_planner(method, duration=self.duration, replan_interval=self.replan_interval)
+        self.reference = None
 
     # ------------------------------------------------------------------ threads
     def camera_thread(self):
@@ -221,6 +227,10 @@ class StewartBallController:
         setpoint_px = (int(center_x + self.setpoint[0] * pixels_per_cm),
                        int(center_y - self.setpoint[1] * pixels_per_cm))   # image y points down
         cv2.drawMarker(overlay, setpoint_px, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
+        if self.method != "step" and self.reference is not None:
+            reference_px = (int(center_x + self.reference[0][0] * pixels_per_cm),
+                            int(center_y - self.reference[0][1] * pixels_per_cm))
+            cv2.circle(overlay, reference_px, 7, (0, 255, 255), 2)   # yellow ring: where the plan says the ball should be
         return overlay
 
     def control_thread(self):
@@ -252,11 +262,12 @@ class StewartBallController:
                 print(f"[CONTROL] Could not level the platform on exit: {error}")
 
     # ------------------------------------------------------------------ GUI
-    def add_slider(self, name, label, value, low, high):
-        ttk.Label(self.root, text=label, font=("Arial", 12)).pack()
+    def add_slider(self, name, label, value, low, high, parent=None):
+        parent = parent or self.root
+        ttk.Label(parent, text=label, font=("Arial", 12)).pack()
         var = tk.DoubleVar(value=value)
-        ttk.Scale(self.root, from_=low, to=high, variable=var, orient=tk.HORIZONTAL, length=500).pack(pady=3)
-        value_label = ttk.Label(self.root, text="", font=("Arial", 11))
+        ttk.Scale(parent, from_=low, to=high, variable=var, orient=tk.HORIZONTAL, length=500).pack(pady=3)
+        value_label = ttk.Label(parent, text="", font=("Arial", 11))
         value_label.pack()
         self.sliders[name] = (var, value_label)
 
@@ -264,22 +275,41 @@ class StewartBallController:
         """Build the Tkinter window: gain and setpoint sliders, enable box, buttons and status."""
         self.root = tk.Tk()
         self.root.title("Stewart Platform PID Controller")
-        self.root.geometry("560x720")
+        self.root.geometry("560x620")
         ttk.Label(self.root, text="PID Gains (both axes)", font=("Arial", 16, "bold")).pack(pady=8)
 
+        # Two tabs: the PID gains and target as before, and the trajectory settings on a second tab.
+        # This keeps the window short enough for a 720-pixel-high screen, so the Enable box and the
+        # buttons below the tabs stay visible.
+        tabs = ttk.Notebook(self.root)
+        tabs.pack()
+        pid_tab = ttk.Frame(tabs)
+        method_tab = ttk.Frame(tabs)
+        tabs.add(pid_tab, text="PID and target")
+        tabs.add(method_tab, text="Method")
+
         self.sliders = {}
-        self.add_slider("Kp", "Kp (Proportional, deg per cm)", self.Kp, 0, 3)
-        self.add_slider("Ki", "Ki (Integral)", self.Ki, 0, 1)
-        self.add_slider("Kd", "Kd (Derivative, deg per cm/s)", self.Kd, 0, 2)
+        self.add_slider("Kp", "Kp (Proportional, deg per cm)", self.Kp, 0, 3, pid_tab)
+        self.add_slider("Ki", "Ki (Integral)", self.Ki, 0, 1, pid_tab)
+        self.add_slider("Kd", "Kd (Derivative, deg per cm/s)", self.Kd, 0, 2, pid_tab)
         limit = self.plate_radius_cm
-        self.add_slider("Setpoint X", "Setpoint X (cm from centre)", 0.0, -limit, limit)
-        self.add_slider("Setpoint Y", "Setpoint Y (cm from centre)", 0.0, -limit, limit)
+        self.add_slider("Setpoint X", "Setpoint X (cm from centre)", 0.0, -limit, limit, pid_tab)
+        self.add_slider("Setpoint Y", "Setpoint Y (cm from centre)", 0.0, -limit, limit, pid_tab)
+
+        ttk.Label(method_tab, text="How the ball is moved to the target", font=("Arial", 12, "bold")).pack(pady=(10, 0))
+        self.method_var = tk.StringVar(value=self.method)
+        for value, label in self.METHOD_LABELS.items():
+            ttk.Radiobutton(method_tab, text=label, value=value, variable=self.method_var).pack(anchor="w", padx=40)
+        self.add_slider("Duration", "Move duration (s, trajectory methods)", self.duration, 0.5, 8, method_tab)
+        self.add_slider("Replan", "Replan interval (s, replanning method)", self.replan_interval, 0.1, 2, method_tab)
+        self.add_slider("Feedforward", "Acceleration feedforward (0 = PID only, 1 = full)", self.feedforward, 0, 1, method_tab)
 
         self.enable_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.root, text="Enable control (platform tilts)", variable=self.enable_var).pack(pady=8)
 
         buttons = ttk.Frame(self.root)
         buttons.pack(pady=8)
+        ttk.Button(buttons, text="Restart move", command=self.planner_reset).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Level platform", command=self.level_button).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Reset integral", command=self.reset_integral).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Plot results", command=self.plot_results).pack(side=tk.LEFT, padx=4)
@@ -302,6 +332,14 @@ class StewartBallController:
         self.Ki = self.sliders["Ki"][0].get()
         self.Kd = self.sliders["Kd"][0].get()
         self.setpoint = [self.sliders["Setpoint X"][0].get(), self.sliders["Setpoint Y"][0].get()]
+        self.duration = self.sliders["Duration"][0].get()
+        self.replan_interval = self.sliders["Replan"][0].get()
+        self.feedforward = self.sliders["Feedforward"][0].get()
+        if self.method_var.get() != self.method:
+            self.set_method(self.method_var.get())
+        for attribute in ("duration", "replan_interval"):   # used from the next move on
+            if hasattr(self.planner, attribute):
+                setattr(self.planner, attribute, getattr(self, attribute))
         self.enabled = self.enable_var.get()
         for name, (var, label) in self.sliders.items():
             label.config(text=f"{name}: {var.get():.2f}")
@@ -320,35 +358,45 @@ class StewartBallController:
         self.enabled = False
         self.level()
 
+    def planner_reset(self):
+        """Start the move again from where the ball is now."""
+        self.planner.reset()
+
     def reset_integral(self):
         for pid in self.pid:
             pid.reset()
         print("[RESET] Integral terms reset")
 
     # ------------------------------------------------------------------ results
+    def column(self, name):
+        """One column of the run log as an array."""
+        index = self.COLUMNS.index(name)
+        return np.array([row[index] for row in self.log], dtype=float)
+
     def draw_run(self, fig):
-        """Draw this run on a matplotlib Figure: position vs setpoint for each axis, and the tilt commands.
+        """Draw this run on a matplotlib Figure: position, target and planned path for each axis, and the tilt commands.
 
         Returns False (and draws nothing) if nothing was logged.
         """
         if not self.log:
             return False
-        data = np.array(self.log, dtype=float)
-        t = data[:, 0]
+        t = self.column("time_s")
         axes = fig.subplots(3, 1, sharex=True)
-        for ax, column, setpoint_column, name in ((axes[0], 2, 6, "x"), (axes[1], 3, 7, "y")):
-            ax.plot(t, data[:, column], label=f"ball {name}", linewidth=2)
-            ax.plot(t, data[:, setpoint_column], "--", label=f"setpoint {name}", linewidth=2)
+        for ax, name in zip(axes[:2], ("x", "y")):
+            ax.plot(t, self.column(f"{name}_cm"), label=f"ball {name}", linewidth=2)
+            ax.plot(t, self.column(f"setpoint_{name}_cm"), "--", label=f"target {name}", linewidth=2)
+            ax.plot(t, self.column(f"reference_{name}_cm"), ":", label=f"planned {name}", linewidth=2)
             ax.set_ylabel(f"{name} position (cm)")
             ax.legend(loc="upper right")
             ax.grid(True, alpha=0.3)
-        axes[2].plot(t, data[:, 8], label="tilt x")
-        axes[2].plot(t, data[:, 9], label="tilt y")
+        axes[2].plot(t, self.column("tilt_x_deg"), label="tilt x")
+        axes[2].plot(t, self.column("tilt_y_deg"), label="tilt y")
         axes[2].set_ylabel("Tilt command (deg)")
         axes[2].set_xlabel("Time (s)")
         axes[2].legend(loc="upper right")
         axes[2].grid(True, alpha=0.3)
-        axes[0].set_title(f"{self.run_id}:  Kp={self.Kp:.2f}  Ki={self.Ki:.2f}  Kd={self.Kd:.2f}")
+        axes[0].set_title(f"{self.run_id}: {self.METHOD_LABELS[self.method]}, feedforward {self.feedforward:.1f}, "
+                          f"Kp={self.Kp:.2f} Ki={self.Ki:.2f} Kd={self.Kd:.2f}")
         fig.tight_layout()
         return True
 
@@ -386,10 +434,14 @@ class StewartBallController:
             writer = csv.writer(f)
             writer.writerow(self.COLUMNS)
             for row in self.log:
-                # Blank cells (not "nan") where the ball was not found; found/enabled as 0 or 1
-                cells = [f"{v:.4f}" if v == v else "" for v in row]
-                cells[1] = int(row[1])
-                cells[12] = int(row[12])
+                cells = []
+                for name, value in zip(self.COLUMNS, row):
+                    if name in ("found", "enabled"):
+                        cells.append(int(value))                           # 0 or 1
+                    elif isinstance(value, str):
+                        cells.append(value)                                # the method name
+                    else:
+                        cells.append(f"{value:.4f}" if value == value else "")   # blank where there is no value
                 writer.writerow(cells)
 
         png_path = None

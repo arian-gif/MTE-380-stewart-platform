@@ -18,6 +18,7 @@ pip install -r requirements.txt
 | `python ball_tracking/simple_cal.py` | Camera calibration for the plate: click the ball and press `c`, size the circle with `+`/`-` (`[`/`]` big steps) and move the plate to fit it, press `g`, then `s` to save `config.json` (`l` levels the platform, `r` redoes the circle) |
 | `python ball_tracking/ball_detection.py` | Live test of ball tracking; shows the ball's x, y (mm from the plate centre) and velocity (mm/s) once calibrated; press `q` to save `ball_tracking/tracks/ball_track_<date>.csv` + `.png` and show position-time and velocity-time graphs |
 | `python ball_tracking/basic_controller.py --dry-run` | PID ball-balancing controller: camera -> ball x, y and velocity -> PID per axis -> plate tilt -> servos. GUI sliders for Kp, Ki, Kd and the x/y setpoint; tick "Enable control" to start. Drop `--dry-run` to move the real platform. When you stop, each run is saved as `ball_tracking/tuning_runs/csv/run_<date>_<time>.csv` (all logged values) and `ball_tracking/tuning_runs/plots/run_<date>_<time>.png` (position, setpoint and tilt plots) with matching names. The **Plot results** button also shows the plot |
+| `python ball_tracking/trajectory_study.py` | Simulation study of the three ways to move the ball to the target (step, trajectory, trajectory + replanning), each with and without acceleration feedforward: plots, tables and `results.csv` in `ball_tracking/trajectory_study/`. `--quick` is a fast run; `--csv ball_tracking/tuning_runs/csv/run_xxx.csv` scores a run recorded on the real platform |
 | `python motor_control.py 1 90 --dry-run` | Shows the command that would be sent to motor 1 (no hardware) |
 | `python motor_control.py 1 90 --port COMx` | Moves motor 1 to 90 deg |
 
@@ -30,7 +31,12 @@ pip install -r requirements.txt
 - `ball_tracking/` — camera and control (run from anywhere; they find their own `config.json`)
   - `simple_cal.py` — calibration, writes `config.json` (ball colour, plate centre and scale)
   - `ball_detection.py` — ball detector, `BallTracker` (alpha-beta position and velocity), CSV and plots
-  - `basic_controller.py` — the PID controller
+  - `basic_controller.py` — the PID controller. GUI **Method**: Step (aim straight at the target), Trajectory (a smooth Hermite path planned when the move starts) or Trajectory + replanning (replanned from the measured state every few tenths of a second); plus move duration, replan interval and an acceleration feedforward slider (0 = PID only). Changing the target slider, or pressing **Restart move**, starts a new move from where the ball is
+  - `pid.py` — the PID for one axis (P on position error, D on velocity error, anti-windup)
+  - `trajectory.py` — the Hermite path, the feasible-duration search and the three planners
+  - `metrics.py` — settling time, overshoot, RMS tracking error, cross-track error, final accuracy, effort
+  - `trajectory_study.py` — the simulation study and the scorer for real runs
+  - `trajectory_study/REPORT.md` — what the study found
 
 ## TODO
 

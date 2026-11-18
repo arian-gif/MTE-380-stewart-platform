@@ -28,6 +28,11 @@ PLATE_RADIUS_M = 0.135
 
 LEVEL_ALPHA, LEVEL_BETA = 90.0, 90.0  # platform angles for a level plate
 
+def outlined_text(image, text, origin, scale, color, thickness):
+    """Text with a dark outline, so it stays readable over the circle and the camera picture."""
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 2)
+    cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+
 class StewartCalibrator:
     """Interactive calibration for the ball-on-plate camera setup."""
 
@@ -76,12 +81,21 @@ class StewartCalibrator:
             print(f"[PLATFORM] Not connected - 'l' (level) is disabled.\n{error.code}")
 
     def level_platform(self):
-        """Send the platform to level so you can check the servos and the camera view."""
+        """Send the platform to its zero pose: no tilt, platform centre at its setpoint x0.
+
+        "No tilt" is alpha = beta = 90 in the notes' convention (80 to 100 is the allowed range).
+        Done automatically when the program starts, and again with the 'l' key.
+        """
         if self.link is None:
             print("[PLATFORM] Not connected")
             return
-        print("[PLATFORM] Moving to level")
-        platform_control.tilt_platform(self.link, LEVEL_ALPHA, LEVEL_BETA)
+        x0 = platform_control.sk.X0
+        print(f"[PLATFORM] Going to the zero pose: alpha = {LEVEL_ALPHA:g}, beta = {LEVEL_BETA:g} (no tilt), "
+              f"platform centre x0 = ({x0[0]:g}, {x0[1]:g}, {x0[2]:g}) mm")
+        try:
+            platform_control.tilt_platform(self.link, LEVEL_ALPHA, LEVEL_BETA)
+        except ValueError as error:
+            print(f"[PLATFORM] Could not move: {error}")
 
     def mouse_callback(self, event, x, y, flags, param):
         """Handle mouse click events for interactive calibration.
@@ -233,6 +247,15 @@ class StewartCalibrator:
             json.dump(config, f, indent=2)
         print(f"[SAVE] Configuration saved to {CONFIG_PATH}")
 
+    def draw_plus_y(self, overlay, center, radius, color):
+        """A dot at the top of the circle, marking the positive y direction (up in the image)."""
+        # (kept at least 14 px from the top edge of the picture, so the dot and its label stay visible
+        # when the circle is nearly as tall as the picture)
+        top = (int(center[0]), max(int(center[1]) - int(radius), 14))
+        cv2.circle(overlay, top, 8, color, -1)
+        cv2.circle(overlay, top, 8, (255, 255, 255), 1)   # thin white rim so it shows on any background
+        outlined_text(overlay, "+Y", (top[0] + 14, top[1] + 7), 0.7, (255, 255, 255), 2)
+
     def draw_overlay(self, frame):
         """Draw calibration status and instructions overlay on frame.
 
@@ -245,17 +268,12 @@ class StewartCalibrator:
         overlay = frame.copy()
 
         # Phase-specific instruction text
+        # (two short lines, kept to the left of the middle of the frame so they never cover the +Y dot)
         phase_text = {
-            "color": "Click on the ball to sample its colour. Press 'c' when done.",
-            "geometry": "Move the plate to fit the circle. +/- size ([ ] big steps), 'g' when it fits",
-            "complete": "Calibration complete! Press 's' to save"
+            "color": ["Click the ball to sample its colour.", "Press 'c' when done."],
+            "geometry": ["Move the plate to fit the circle.", "+/- size, [ ] big steps, 'g' = it fits"],
+            "complete": ["Calibration complete!", "Press 's' to save"]
         }
-
-        # Draw current phase and instructions
-        cv2.putText(overlay, f"Phase: {self.phase}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(overlay, phase_text[self.phase], (10, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # Show color calibration progress
         if self.hsv_samples:
@@ -266,6 +284,7 @@ class StewartCalibrator:
         if self.phase == "geometry":
             cv2.circle(overlay, self.circle_center_px, self.circle_radius_px, (0, 255, 0), 2)
             cv2.drawMarker(overlay, self.circle_center_px, (0, 255, 0), cv2.MARKER_CROSS, 20, 1)
+            self.draw_plus_y(overlay, self.circle_center_px, self.circle_radius_px, (0, 255, 0))
             cv2.putText(overlay, f"Circle radius: {self.circle_radius_px} px = {PLATE_RADIUS_M * 1000:.0f} mm",
                        (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
@@ -273,6 +292,14 @@ class StewartCalibrator:
         if self.plate_center_px:
             radius_px = int(PLATE_RADIUS_M / self.pixel_to_meter_ratio)
             cv2.circle(overlay, self.plate_center_px, radius_px, (255, 0, 0), 2)
+            self.draw_plus_y(overlay, self.plate_center_px, radius_px, (255, 0, 0))
+
+        # Current phase and instructions
+        cv2.putText(overlay, f"Phase: {self.phase}", (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        for line_number, line in enumerate(phase_text[self.phase]):
+            cv2.putText(overlay, line, (10, 55 + 18 * line_number),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # Show real-time ball detection once the colour is calibrated
         ball = self.find_ball(frame)
@@ -308,6 +335,7 @@ class StewartCalibrator:
 
         # Attempt platform connection
         self.connect_platform()
+        self.level_platform()   # turn the motors on and go to the zero pose before calibrating
 
         # Display instructions
         print("[INFO] Stewart Platform Calibration")
