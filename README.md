@@ -31,9 +31,9 @@ pip install -r requirements.txt
 - `ball_tracking/` — camera and control (run from anywhere; they find their own `config.json`)
   - `simple_cal.py` — calibration, writes `config.json` (ball colour, plate centre and scale)
   - `ball_detection.py` — ball detector, `BallTracker` (alpha-beta position and velocity), CSV and plots
-  - `basic_controller.py` — the PID controller. GUI **Method**: Step (aim straight at the target), Trajectory (a smooth Hermite path planned when the move starts) or Trajectory + replanning (replanned from the measured state every few tenths of a second); plus move duration, replan interval and an acceleration feedforward slider (0 = PID only). Changing the target slider, or pressing **Restart move**, starts a new move from where the ball is
+  - `basic_controller.py` — the PID controller. GUI **Method**: Step (aim straight at the target), Trajectory (a smooth Hermite path planned when the move starts) or Trajectory + replanning (replanned from the measured state every few tenths of a second) or Trajectory to centre (straight to the target at a cruise speed, slowing down smoothly as it gets close; the **To centre** tab sets the cruise speed and where the slowing starts); plus move duration, replan interval and an acceleration feedforward slider (0 = PID only). Changing the target slider, or pressing **Restart move**, starts a new move from where the ball is. The **Path** tab sends the ball round a shape centred on the target instead of stopping there: line, triangle, square (corner to corner, one move per side), circle or infinity sign (continuous, with a lap time); the shape is drawn on the camera view and as an x-y plot in the run's PNG
   - `pid.py` — the PID for one axis (P on position error, D on velocity error, anti-windup)
-  - `trajectory.py` — the Hermite path, the feasible-duration search and the three planners
+  - `trajectory.py` — the Hermite path, the feasible-duration search, the planners (step, trajectory, replanning, to centre) and `ShapePlanner` (shapes round the target)
   - `metrics.py` — settling time, overshoot, RMS tracking error, cross-track error, final accuracy, effort
   - `trajectory_study.py` — the simulation study and the scorer for real runs
   - `trajectory_study/REPORT.md` — what the study found
