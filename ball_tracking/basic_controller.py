@@ -32,7 +32,7 @@ import motor_control
 import platform_control
 from ball_detection import (BallDetector, BallTracker, CAPTURE_SIZE, PROCESS_SIZE,
                             CONFIG_PATH, HERE, fit_square)
-from pid import AxisPID
+from pid import AxisPID, CENTRE_PD_GAINS, CONTROLLER_DEFAULT_GAINS
 from trajectory import make_planner, tilt_for_acceleration
 
 LEVEL_ALPHA, LEVEL_BETA = 90.0, 90.0   # platform angles for a level plate
@@ -71,9 +71,7 @@ class StewartBallController:
 
         # PID gains (set by the sliders). Starting point from the ball's physics: a rolling ball
         # accelerates about 12 cm/s^2 per degree of tilt; tune on the real platform from here.
-        self.Kp = 0.3
-        self.Ki = 0.05
-        self.Kd = 0.35
+        self.Kp, self.Ki, self.Kd = CONTROLLER_DEFAULT_GAINS
         self.setpoint = [0.0, 0.0]               # cm from the plate centre
         self.pid = [AxisPID(), AxisPID()]        # x axis, y axis
 
@@ -95,6 +93,8 @@ class StewartBallController:
         self.tilt = None                         # last tilt sent (x, y) in degrees; None = nothing sent yet
         self.last_seen = time.time()             # last time the ball was found
         self.last_control_time = None
+        self.centre_start = None
+        self.centre_peak = None  # (cm, %), retained when control stops
         self.sample_queue = queue.Queue(maxsize=1)   # newest camera sample only
 
         # Shown in the GUI
@@ -149,6 +149,7 @@ class StewartBallController:
         dt = None if self.last_control_time is None else t - self.last_control_time
         self.last_control_time = t
         if dt is None or not (0 < dt <= LOST_TIMEOUT_S):
+            self.centre_start = None
             for pid in self.pid:
                 pid.reset()
             dt = 1 / 30
@@ -164,6 +165,19 @@ class StewartBallController:
             # Add the tilt that gives the ball the planned acceleration (zero for the step method)
             extra = self.feedforward * tilt_for_acceleration(self.planner.acceleration(t))
             tilt = [float(np.clip(tilt[axis] + extra[axis], -MAX_TILT_DEG, MAX_TILT_DEG)) for axis in range(2)]
+        if self.method == "step" and self.setpoint == [0.0, 0.0]:
+            start = self.centre_start
+            if start is None:
+                start = np.array(position_cm)
+                self.centre_start = start
+                self.centre_peak = None
+            distance = np.linalg.norm(start)
+            if distance > 1e-9:
+                past = -np.dot(position_cm, start) / distance
+                peak = max(self.centre_peak[0] if self.centre_peak else 0.0, past)
+                self.centre_peak = (peak, 100 * peak / distance)
+        else:
+            self.centre_start = self.centre_peak = None
         self.send_tilt(*tilt)
         self.status = "CONTROLLING"
         return tuple(tilt)
@@ -288,6 +302,21 @@ class StewartBallController:
         tabs.add(pid_tab, text="PID and target")
         tabs.add(method_tab, text="Method")
 
+        overshoot_tab = ttk.Frame(tabs)
+        tabs.add(overshoot_tab, text="Maximum overshoot")
+        ttk.Label(overshoot_tab, text="Step response to plate centre", font=("Arial", 12, "bold")).pack(pady=12)
+        ttk.Label(overshoot_tab, text="Choose gains while control is off. Start the ball away from centre,\n"
+                  "then enable control. Record one move per session for comparison.").pack(padx=12)
+        self.overshoot_buttons = []
+        for label, gains in (("Baseline PID", CONTROLLER_DEFAULT_GAINS), ("Low-overshoot PD", CENTRE_PD_GAINS)):
+            button = ttk.Button(overshoot_tab, text=f"{label}   Kp={gains[0]}   Ki={gains[1]}   Kd={gains[2]}",
+                                command=lambda g=gains: self.prepare_centre_trial(g))
+            button.pack(pady=6)
+            self.overshoot_buttons.append(button)
+
+        self.peak_label = ttk.Label(overshoot_tab, text="")
+        self.peak_label.pack(pady=8)
+
         self.sliders = {}
         self.add_slider("Kp", "Kp (Proportional, deg per cm)", self.Kp, 0, 3, pid_tab)
         self.add_slider("Ki", "Ki (Integral)", self.Ki, 0, 1, pid_tab)
@@ -341,9 +370,14 @@ class StewartBallController:
             if hasattr(self.planner, attribute):
                 setattr(self.planner, attribute, getattr(self, attribute))
         self.enabled = self.enable_var.get()
+        for button in self.overshoot_buttons:
+            button.state(["disabled"] if self.enabled else ["!disabled"])
         for name, (var, label) in self.sliders.items():
             label.config(text=f"{name}: {var.get():.2f}")
 
+        peak = self.centre_peak
+        self.peak_label.config(text="Peak overshoot: --" if peak is None else
+                               f"Peak overshoot: {peak[0]:.2f} cm ({peak[1]:.1f}%)")
         self.status_label.config(text=f"State: {self.status}")
         position = self.position_cm
         self.ball_label.config(text="Ball: not seen" if position is None
@@ -351,6 +385,13 @@ class StewartBallController:
         tilt = self.tilt or (0.0, 0.0)
         self.tilt_label.config(text=f"Tilt: x = {tilt[0]:.1f} deg, y = {tilt[1]:.1f} deg")
         self.root.after(50, self.update_gui)
+
+    def prepare_centre_trial(self, gains):
+        if self.enable_var.get() or self.enabled:
+            return
+        for name, value in zip(("Kp", "Ki", "Kd", "Setpoint X", "Setpoint Y", "Feedforward"), (*gains, 0, 0, 0)):
+            self.sliders[name][0].set(value)
+        self.method_var.set("step")
 
     def level_button(self):
         """Turn control off and level the platform."""
@@ -361,6 +402,7 @@ class StewartBallController:
     def planner_reset(self):
         """Start the move again from where the ball is now."""
         self.planner.reset()
+        self.centre_start = None
 
     def reset_integral(self):
         for pid in self.pid:

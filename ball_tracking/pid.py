@@ -4,6 +4,10 @@ import numpy as np
 from trajectory import MAX_TILT_DEG
 
 
+CONTROLLER_DEFAULT_GAINS = (0.30, 0.05, 0.35)  # Kp, Ki, Kd
+CENTRE_PD_GAINS = (0.30, 0.0, 0.35)  # selected by overshoot_study.py
+
+
 class AxisPID:
     """PID for one axis: error in cm, output is a tilt in degrees.
 

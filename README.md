@@ -22,6 +22,21 @@ pip install -r requirements.txt
 | `python motor_control.py 1 90 --dry-run` | Shows the command that would be sent to motor 1 (no hardware) |
 | `python motor_control.py 1 90 --port COMx` | Moves motor 1 to 90 deg |
 
+## Maximum overshoot experiment
+
+Run `python ball_tracking/overshoot_study.py` to test 24 PID settings. Each setting gets the same nine initial conditions (5, 10 and 12 cm from centre, moving inward at 15 cm/s, stationary or moving outward at 15 cm/s). The study writes per-trial metrics to `ball_tracking/tuning_runs/overshoot/gain_sweep.csv` and plots the 10 cm release from rest in `centre_step.png`.
+
+Overshoot is the greatest distance past centre projected onto the line from start to target. The sweep considers gains that keep the ball on the plate and settle inside a 0.5 cm radius in all nine 10-second trials. It minimizes worst-case overshoot, breaking ties by worst settling time.
+
+| Controller | Kp | Ki | Kd | Worst simulated overshoot | Trials settled |
+|---|---:|---:|---:|---:|---:|
+| Baseline PID | 0.30 | 0.05 | 0.35 | 1.587 cm | 3/9 |
+| Low-overshoot PD | 0.30 | 0 | 0.35 | 0.031 cm | 9/9 |
+
+The integral accumulates while the ball approaches centre and continues to demand tilt as it crosses. Removing that contribution lets velocity feedback brake the ball sooner. For a level plate the linearized PD model has damping ratio `(friction + a * Kd) / (2 * sqrt(a * Kp))`, where `a = (5/7) * 981 * pi/180` in cm/s squared per degree. The selected gains give about 1.20 before servo and camera lag. Persistent tilt bias can leave a PD controller with a steady position error.
+
+**Hardware comparison.** Open `python ball_tracking/basic_controller.py`. With control off, choose **Baseline PID** or **Low-overshoot PD** in the **Maximum overshoot** tab. Both presets select Step, centre the target and clear feedforward. The tab displays the measured peak in cm and percent during the move. Place the tracked ball at the same marked starting point for each run, enable control once, record 10 seconds, then stop. Use a fresh session for each trial. Compare a saved run with `python ball_tracking/overshoot_study.py --csv ball_tracking/tuning_runs/csv/run_<date>_<time>.csv`. It reports measured and simulated peak overshoot and settling time, and saves an overlay using the recorded starting position, velocity, gains and observation duration. Use a continuously tracked trial with fixed gains. Positive displacement on the plot indicates a crossing past centre.
+
 ## Files
 
 - `functions.py` — slide forward/inverse kinematics for the three actuators
