@@ -32,8 +32,9 @@ import motor_control
 import platform_control
 from ball_detection import (BallDetector, BallTracker, CAPTURE_SIZE, PROCESS_SIZE,
                             CONFIG_PATH, HERE, fit_square)
+from metrics import distance_to_path, tracking_errors
 from pid import AxisPID
-from trajectory import make_planner, tilt_for_acceleration
+from trajectory import SHAPES, make_planner, relevant_settings, shape_outline, tilt_for_acceleration
 
 LEVEL_ALPHA, LEVEL_BETA = 90.0, 90.0   # platform angles for a level plate
 MAX_TILT_DEG = 10.0                    # the platform accepts alpha and beta within 90 +/- 10
@@ -54,8 +55,10 @@ class StewartBallController:
     COLUMNS = ["time_s", "found", "x_cm", "y_cm", "vx_cm_s", "vy_cm_s", "setpoint_x_cm", "setpoint_y_cm",
                "reference_x_cm", "reference_y_cm", "reference_vx_cm_s", "reference_vy_cm_s",
                "tilt_x_deg", "tilt_y_deg", "alpha_deg", "beta_deg", "enabled", "kp", "ki", "kd",
-               "method", "feedforward", "duration_s", "replan_interval_s"]
-    METHOD_LABELS = {"step": "Step", "trajectory": "Trajectory", "update": "Trajectory + replanning"}
+               "method", "feedforward", "duration_s", "replan_interval_s", "shape", "size_cm", "lap_time_s",
+               "cruise_speed_cm_s", "slow_distance_cm", "replan_error_cm"]
+    METHOD_LABELS = {"step": "Step", "trajectory": "Trajectory", "update": "Trajectory + replanning",
+                    "center": "Trajectory to centre (slows down)"}
 
     def __init__(self, link, config_file=CONFIG_PATH):
         """Load the calibration and set defaults. link is a motor_control.MotorLink."""
@@ -85,7 +88,15 @@ class StewartBallController:
         self.duration = 3.0                      # s, planned length of a move (trajectory methods)
         self.replan_interval = 0.5               # s, how often the path is replanned ("update")
         self.feedforward = 0.0                   # 0 = PID only, 1 = also tilt for the planned acceleration
-        self.planner = make_planner(self.method, duration=self.duration, replan_interval=self.replan_interval)
+        # The path the ball follows: "none" = stop at the setpoint, or go round a shape centred on the setpoint
+        # (line, triangle, square, circle, infinity)
+        self.shape = "none"
+        self.size = 4.0                          # cm, radius of the shape (centre to corner)
+        self.lap_time = 10.0                     # s, one lap of a circle or infinity sign
+        self.cruise_speed = 8.0                  # cm/s, top speed of "Trajectory to centre"
+        self.slow_distance = 4.0                 # cm from the target where "Trajectory to centre" starts slowing down
+        self.replan_error = 3.0                  # cm: "Trajectory to centre" replans when the ball is this far off its plan (0 = never)
+        self.planner = self.new_planner()
         self.reference = None                    # (position, velocity) the PID is aiming at, None when not controlling
 
         # Controller state
@@ -182,12 +193,29 @@ class StewartBallController:
         self.log.append([t - self.start_time, int(found), x, y, vx, vy, self.setpoint[0], self.setpoint[1],
                          ref_x, ref_y, ref_vx, ref_vy, tilt[0], tilt[1], alpha, beta, int(self.enabled),
                          self.Kp, self.Ki, self.Kd, self.method, self.feedforward, self.duration,
-                         self.replan_interval])
+                         self.replan_interval, self.shape, self.size, self.lap_time,
+                         self.cruise_speed, self.slow_distance, self.replan_error])
+
+    def new_planner(self):
+        """A planner for the current method and shape."""
+        return make_planner(self.method, duration=self.duration, replan_interval=self.replan_interval,
+                            shape=self.shape, size=self.size, lap_time=self.lap_time,
+                            cruise_speed=self.cruise_speed, slow_distance=self.slow_distance,
+                            replan_error=self.replan_error)
 
     def set_method(self, method):
         """Switch between "step", "trajectory" and "update". The next move starts fresh."""
         self.method = method
-        self.planner = make_planner(method, duration=self.duration, replan_interval=self.replan_interval)
+        self.planner = self.new_planner()
+        self.reference = None
+
+    def set_shape(self, shape):
+        """Switch the path ("none", "triangle", "circle", ...). The next move starts fresh."""
+        self.planner = make_planner(self.method, duration=self.duration, replan_interval=self.replan_interval,
+                                    shape=shape, size=self.size, lap_time=self.lap_time,
+                                    cruise_speed=self.cruise_speed, slow_distance=self.slow_distance,
+                                    replan_error=self.replan_error)
+        self.shape = shape      # after the planner, so the camera thread never sees a shape without its planner
         self.reference = None
 
     # ------------------------------------------------------------------ threads
@@ -227,7 +255,12 @@ class StewartBallController:
         setpoint_px = (int(center_x + self.setpoint[0] * pixels_per_cm),
                        int(center_y - self.setpoint[1] * pixels_per_cm))   # image y points down
         cv2.drawMarker(overlay, setpoint_px, (255, 0, 255), cv2.MARKER_TILTED_CROSS, 18, 2)
-        if self.method != "step" and self.reference is not None:
+        if self.shape != "none":   # the path the ball is asked to follow (thin yellow line)
+            outline = self.planner.outline(self.setpoint)
+            points = np.array([[center_x + x * pixels_per_cm, center_y - y * pixels_per_cm] for x, y in outline],
+                              dtype=np.int32)
+            cv2.polylines(overlay, [points], False, (0, 200, 255), 1)
+        if (self.method != "step" or self.shape != "none") and self.reference is not None:
             reference_px = (int(center_x + self.reference[0][0] * pixels_per_cm),
                             int(center_y - self.reference[0][1] * pixels_per_cm))
             cv2.circle(overlay, reference_px, 7, (0, 255, 255), 2)   # yellow ring: where the plan says the ball should be
@@ -264,12 +297,33 @@ class StewartBallController:
     # ------------------------------------------------------------------ GUI
     def add_slider(self, name, label, value, low, high, parent=None):
         parent = parent or self.root
-        ttk.Label(parent, text=label, font=("Arial", 12)).pack()
+        frame = ttk.Frame(parent)       # one slider = one frame, so the GUI can hide it when it does nothing
+        frame.pack()
+        ttk.Label(frame, text=label, font=("Arial", 12)).pack()
         var = tk.DoubleVar(value=value)
-        ttk.Scale(parent, from_=low, to=high, variable=var, orient=tk.HORIZONTAL, length=500).pack(pady=3)
-        value_label = ttk.Label(parent, text="", font=("Arial", 11))
-        value_label.pack()
+        row = ttk.Frame(frame)          # the slider and its value side by side, to save height
+        row.pack()
+        ttk.Scale(row, from_=low, to=high, variable=var, orient=tk.HORIZONTAL, length=380).pack(side=tk.LEFT, pady=3)
+        value_label = ttk.Label(row, text="", font=("Arial", 11), width=18)
+        value_label.pack(side=tk.LEFT)
         self.sliders[name] = (var, value_label)
+        self.slider_frames.setdefault(parent, []).append((name, frame))
+
+    # slider name -> the planner setting it changes (see trajectory.relevant_settings)
+    SLIDER_SETTING = {"Duration": "duration", "Replan": "replan_interval", "Feedforward": "feedforward",
+                      "Cruise": "cruise_speed", "Slow": "slow_distance", "ReplanError": "replan_error",
+                      "Size": "size", "Lap": "lap_time"}
+
+    def refresh_sliders(self):
+        """Show only the sliders that change something for the chosen method and shape."""
+        relevant = relevant_settings(self.method, self.shape)
+        for frames in self.slider_frames.values():
+            for _, frame in frames:
+                frame.pack_forget()
+            for name, frame in frames:          # pack again in the original order
+                setting = self.SLIDER_SETTING.get(name)
+                if setting is None or setting in relevant:
+                    frame.pack()
 
     def create_gui(self):
         """Build the Tkinter window: gain and setpoint sliders, enable box, buttons and status."""
@@ -287,8 +341,11 @@ class StewartBallController:
         method_tab = ttk.Frame(tabs)
         tabs.add(pid_tab, text="PID and target")
         tabs.add(method_tab, text="Method")
+        path_tab = ttk.Frame(tabs)
+        tabs.add(path_tab, text="Path")
 
         self.sliders = {}
+        self.slider_frames = {}     # tab -> [(slider name, frame)] in order
         self.add_slider("Kp", "Kp (Proportional, deg per cm)", self.Kp, 0, 3, pid_tab)
         self.add_slider("Ki", "Ki (Integral)", self.Ki, 0, 1, pid_tab)
         self.add_slider("Kd", "Kd (Derivative, deg per cm/s)", self.Kd, 0, 2, pid_tab)
@@ -302,7 +359,23 @@ class StewartBallController:
             ttk.Radiobutton(method_tab, text=label, value=value, variable=self.method_var).pack(anchor="w", padx=40)
         self.add_slider("Duration", "Move duration (s, trajectory methods)", self.duration, 0.5, 8, method_tab)
         self.add_slider("Replan", "Replan interval (s, replanning method)", self.replan_interval, 0.1, 2, method_tab)
+        self.add_slider("Cruise", "Cruise speed (cm/s)", self.cruise_speed, 2, 20, method_tab)
+        self.add_slider("Slow", "Start slowing down this far from the target (cm)", self.slow_distance, 1, 10, method_tab)
+        self.add_slider("ReplanError", "Replan when this far off the plan (cm, 0 = never)", self.replan_error, 0, 6, method_tab)
         self.add_slider("Feedforward", "Acceleration feedforward (0 = PID only, 1 = full)", self.feedforward, 0, 1, method_tab)
+
+        ttk.Label(path_tab, text="Path (centred on the setpoint)", font=("Arial", 12, "bold")).pack(pady=(10, 4))
+        self.shape_var = tk.StringVar(value=self.shape)
+        shape_row = ttk.Frame(path_tab)
+        shape_row.pack()
+        for index, shape in enumerate(SHAPES):   # two columns of radio buttons
+            ttk.Radiobutton(shape_row, text=shape if shape != "none" else "none (stop at setpoint)", value=shape,
+                            variable=self.shape_var).grid(row=index // 2, column=index % 2, sticky="w", padx=20)
+        self.add_slider("Size", "Size: radius (cm, centre to corner)", self.size, 1, min(10.0, limit - 3), path_tab)
+        self.add_slider("Lap", "Lap time (s, circle and infinity)", self.lap_time, 3, 30, path_tab)
+
+        self.refresh_sliders()
+        self.shown = (self.method, self.shape)
 
         self.enable_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.root, text="Enable control (platform tilts)", variable=self.enable_var).pack(pady=8)
@@ -313,6 +386,7 @@ class StewartBallController:
         ttk.Button(buttons, text="Level platform", command=self.level_button).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Reset integral", command=self.reset_integral).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Plot results", command=self.plot_results).pack(side=tk.LEFT, padx=4)
+        ttk.Button(buttons, text="Visualize error", command=self.visualize_error).pack(side=tk.LEFT, padx=4)
         ttk.Button(buttons, text="Stop", command=self.stop).pack(side=tk.LEFT, padx=4)
 
         self.status_label = ttk.Label(self.root, text="", font=("Arial", 13, "bold"))
@@ -335,9 +409,19 @@ class StewartBallController:
         self.duration = self.sliders["Duration"][0].get()
         self.replan_interval = self.sliders["Replan"][0].get()
         self.feedforward = self.sliders["Feedforward"][0].get()
+        self.cruise_speed = self.sliders["Cruise"][0].get()
+        self.slow_distance = self.sliders["Slow"][0].get()
+        self.replan_error = self.sliders["ReplanError"][0].get()
+        self.size = self.sliders["Size"][0].get()
+        self.lap_time = self.sliders["Lap"][0].get()
         if self.method_var.get() != self.method:
             self.set_method(self.method_var.get())
-        for attribute in ("duration", "replan_interval"):   # used from the next move on
+        if self.shape_var.get() != self.shape:
+            self.set_shape(self.shape_var.get())
+        if (self.method, self.shape) != self.shown:     # a different method or shape: show only what it uses
+            self.refresh_sliders()
+            self.shown = (self.method, self.shape)
+        for attribute in ("duration", "replan_interval", "size", "lap_time", "cruise_speed", "slow_distance", "replan_error"):   # duration: from the next move on
             if hasattr(self.planner, attribute):
                 setattr(self.planner, attribute, getattr(self, attribute))
         self.enabled = self.enable_var.get()
@@ -381,7 +465,21 @@ class StewartBallController:
         if not self.log:
             return False
         t = self.column("time_s")
-        axes = fig.subplots(3, 1, sharex=True)
+        if self.shape != "none":
+            # a shape: the three time plots on the left, the ball's path in x-y on the right
+            grid = fig.add_gridspec(3, 2, width_ratios=[1.4, 1])
+            axes = [fig.add_subplot(grid[0, 0])]
+            axes += [fig.add_subplot(grid[row, 0], sharex=axes[0]) for row in (1, 2)]
+            path_ax = fig.add_subplot(grid[:, 1])
+            path_ax.plot(self.column("reference_x_cm"), self.column("reference_y_cm"), ":", label="planned", linewidth=2)
+            path_ax.plot(self.column("x_cm"), self.column("y_cm"), label="ball", linewidth=1.5)
+            path_ax.set_aspect("equal")
+            path_ax.set_xlabel("x (cm)")
+            path_ax.set_ylabel("y (cm)")
+            path_ax.legend(loc="upper right")
+            path_ax.grid(True, alpha=0.3)
+        else:
+            axes = fig.subplots(3, 1, sharex=True)
         for ax, name in zip(axes[:2], ("x", "y")):
             ax.plot(t, self.column(f"{name}_cm"), label=f"ball {name}", linewidth=2)
             ax.plot(t, self.column(f"setpoint_{name}_cm"), "--", label=f"target {name}", linewidth=2)
@@ -395,8 +493,9 @@ class StewartBallController:
         axes[2].set_xlabel("Time (s)")
         axes[2].legend(loc="upper right")
         axes[2].grid(True, alpha=0.3)
-        axes[0].set_title(f"{self.run_id}: {self.METHOD_LABELS[self.method]}, feedforward {self.feedforward:.1f}, "
-                          f"Kp={self.Kp:.2f} Ki={self.Ki:.2f} Kd={self.Kd:.2f}")
+        shape_text = "" if self.shape == "none" else f" ({self.shape}, size {self.size:.1f} cm)"
+        fig.suptitle(f"{self.run_id}: {self.METHOD_LABELS[self.method]}{shape_text}, feedforward {self.feedforward:.1f}, "
+                     f"Kp={self.Kp:.2f} Ki={self.Ki:.2f} Kd={self.Kd:.2f}", fontsize=10)
         fig.tight_layout()
         return True
 
@@ -418,6 +517,91 @@ class StewartBallController:
         path = self.plot_path()
         fig.savefig(path, dpi=120)
         print(f"[PLOT] Saved {path}")
+        plt.show()
+
+    # ------------------------------------------------------------------ tracking error
+    def tracking_report(self):
+        """The two tracking errors of the run so far, while the control was on and the ball was seen.
+
+        Returns None if there is nothing to score, else a dict with the times, the pointwise error (distance
+        between the ball and the planned position at the same moment), the cross-track error (shortest
+        distance between the ball and the planned path), the ball, the planned path and the RMS values.
+        """
+        if not self.log:
+            return None
+        on = (self.column("enabled") == 1) & (self.column("found") == 1)
+        if on.sum() < 10:
+            return None
+        t = self.column("time_s")[on]
+        ball = np.column_stack([self.column("x_cm")[on], self.column("y_cm")[on]])
+        reference = np.column_stack([self.column("reference_x_cm")[on], self.column("reference_y_cm")[on]])
+        setpoint = np.array([self.column("setpoint_x_cm")[on][-1], self.column("setpoint_y_cm")[on][-1]])
+        shape = self.shape
+        if shape != "none":
+            path = setpoint + shape_outline(shape, self.size, points=400)    # the shape that was drawn
+            skip = 8.0                                                        # the ball first goes to the path
+        else:
+            path = np.array([ball[0], setpoint])                              # straight from where it started
+            skip = 0.0
+        pointwise = np.linalg.norm(ball - reference, axis=1)
+        cross = distance_to_path(ball, path)
+        rms = tracking_errors(t, ball[:, 0], ball[:, 1], reference[:, 0], reference[:, 1], path, skip)
+        return {"t": t - t[0], "pointwise": pointwise, "cross": cross, "ball": ball, "reference": reference,
+                "path": path, "skip": skip, "rms": rms, "shape": shape}
+
+    def draw_error(self, fig, report):
+        """Draw the tracking errors on a matplotlib Figure: both errors over time with their RMS, and the x-y path."""
+        grid = fig.add_gridspec(2, 2, width_ratios=[1.4, 1])
+        top = fig.add_subplot(grid[0, 0])
+        bottom = fig.add_subplot(grid[1, 0], sharex=top)
+        xy = fig.add_subplot(grid[:, 1])
+        rms = report["rms"]
+        for ax, key, label, color, value in ((top, "pointwise", "Pointwise error (ball vs planned position now)",
+                                              "tab:blue", rms["pointwise_rms_cm"]),
+                                             (bottom, "cross", "Cross-track error (ball vs planned path)",
+                                              "tab:orange", rms["cross_track_rms_cm"])):
+            ax.plot(report["t"], report[key], color=color, linewidth=1.5)
+            ax.axhline(value, color="k", linestyle="--", linewidth=1.5, label=f"RMS = {value:.2f} cm")
+            if report["skip"] > 0:
+                ax.axvspan(0, report["skip"], color="gray", alpha=0.15, label="not scored (going to the path)")
+            ax.set_ylabel("error (cm)")
+            ax.set_title(label, fontsize=10)
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+        bottom.set_xlabel("Time while controlling (s)")
+        xy.plot(report["path"][:, 0], report["path"][:, 1], "k--", linewidth=2, label="planned path")
+        xy.plot(report["ball"][:, 0], report["ball"][:, 1], color="tab:green", linewidth=1.2, label="ball")
+        xy.set_aspect("equal")
+        xy.set_xlabel("x (cm)")
+        xy.set_ylabel("y (cm)")
+        xy.legend(loc="upper right", fontsize=8)
+        xy.grid(True, alpha=0.3)
+        shape_text = "" if report["shape"] == "none" else f", {report['shape']} {self.size:.1f} cm"
+        fig.suptitle(f"{self.run_id}: {self.METHOD_LABELS[self.method]}{shape_text}, feedforward {self.feedforward:.1f}\n"
+                     f"RMS pointwise {rms['pointwise_rms_cm']:.2f} cm (max {rms['pointwise_max_cm']:.2f}),  "
+                     f"RMS cross-track {rms['cross_track_rms_cm']:.2f} cm (max {rms['cross_track_max_cm']:.2f})",
+                     fontsize=10)
+        fig.tight_layout()
+
+    def visualize_error(self):
+        """Turn control off, level the platform, print the two RMS errors and show the error plot (also saved)."""
+        self.level_button()
+        report = self.tracking_report()
+        if report is None:
+            print("[ERROR] Nothing to score yet: run with 'Enable control' on first")
+            return
+        rms = report["rms"]
+        print(f"[ERROR] {self.METHOD_LABELS[self.method]}, shape {report['shape']}: "
+              f"RMS pointwise {rms['pointwise_rms_cm']:.2f} cm, RMS cross-track {rms['cross_track_rms_cm']:.2f} cm "
+              f"(scored after {report['skip']:g} s)")
+        import matplotlib.pyplot as plt   # imported here so the controller starts without it
+
+        fig = plt.figure(figsize=(11, 6))
+        self.draw_error(fig, report)
+        os.makedirs(PLOTS_DIR, exist_ok=True)
+        path = os.path.join(PLOTS_DIR, f"{self.run_id}_error.png")
+        fig.savefig(path, dpi=120)
+        print(f"[ERROR] Saved {path}")
         plt.show()
 
     def save_run(self):
