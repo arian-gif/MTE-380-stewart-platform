@@ -87,3 +87,48 @@ def compute_metrics(t, x, y, target, start, reference_x=None, reference_y=None, 
     result["fell"] = bool(np.any(np.linalg.norm(position, axis=1) > plate_radius))
     result["stable"] = bool(not result["fell"] and result["final_jitter_cm"] < 1.0)
     return result
+
+
+def distance_to_path(points, path):
+    """Shortest distance (cm) from each point to a planned path given as a polyline: arrays (n, 2) and (m, 2).
+
+    This is the cross-track error: how far off the path the ball is, whatever the timing.
+    """
+    points = np.asarray(points, dtype=float)
+    path = np.asarray(path, dtype=float)
+    if len(path) == 1:
+        return np.linalg.norm(points - path[0], axis=1)
+    a, b = path[:-1], path[1:]                           # segment ends, shape (m-1, 2)
+    ab = b - a
+    length2 = np.maximum(np.sum(ab ** 2, axis=1), 1e-12)
+    ap = points[:, None, :] - a[None, :, :]              # (n, m-1, 2)
+    along = np.clip(np.sum(ap * ab[None, :, :], axis=2) / length2[None, :], 0.0, 1.0)
+    nearest = a[None, :, :] + along[:, :, None] * ab[None, :, :]
+    return np.min(np.linalg.norm(points[:, None, :] - nearest, axis=2), axis=1)
+
+
+def tracking_errors(t, x, y, reference_x, reference_y, path, skip=0.0):
+    """The two tracking errors of a planned path, as RMS over the run after `skip` seconds.
+
+    pointwise_rms_cm   distance between the ball and the planned position at the same moment
+                       (timing counts: a ball that is on the path but late scores badly)
+    cross_track_rms_cm shortest distance between the ball and the planned path
+                       (timing does not count: this is path-following accuracy)
+    Also returns the largest values. NaNs (no reference, ball not seen) are ignored.
+    """
+    t = np.asarray(t, dtype=float)
+    keep = t - t[0] >= skip
+    position = np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])[keep]
+    reference = np.column_stack([np.asarray(reference_x, dtype=float), np.asarray(reference_y, dtype=float)])[keep]
+    if len(position) == 0:    # the run ended (the ball fell) before the part being scored
+        return {"pointwise_rms_cm": 99.0, "pointwise_max_cm": 99.0, "cross_track_rms_cm": 99.0, "cross_track_max_cm": 99.0}
+    pointwise = np.linalg.norm(position - reference, axis=1)
+    good = ~np.isnan(position).any(axis=1)
+    cross = np.full(len(position), np.nan)
+    cross[good] = distance_to_path(position[good], path)
+    return {
+        "pointwise_rms_cm": float(np.sqrt(np.nanmean(pointwise ** 2))),
+        "pointwise_max_cm": float(np.nanmax(pointwise)),
+        "cross_track_rms_cm": float(np.sqrt(np.nanmean(cross ** 2))),
+        "cross_track_max_cm": float(np.nanmax(cross)),
+    }

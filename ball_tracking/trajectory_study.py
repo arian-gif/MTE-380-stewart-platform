@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import trajectory as tj
-from metrics import PLATE_RADIUS_CM, compute_metrics
+from metrics import PLATE_RADIUS_CM, compute_metrics, tracking_errors
 from pid import AxisPID
 
 warnings.filterwarnings("ignore", message="Mean of empty slice")
@@ -818,6 +818,21 @@ def score_csv(path):
           f"duration {first.get('duration_s', '?')} s, {len(t)} samples while controlling")
     for key, value in result.items():
         print(f"  {key:22s} {value if isinstance(value, bool) else fmt(value)}")
+
+    # The two tracking errors of the planned path (pointwise and cross-track), after the ball has reached it
+    shape = first.get("shape", "none")
+    if shape in tj.SHAPES and shape != "none":
+        centre = np.array([column("setpoint_x_cm")[on][-1], column("setpoint_y_cm")[on][-1]])
+        path = centre + tj.shape_outline(shape, float(first["size_cm"]), points=400)
+        skip = 8.0
+    else:
+        path = np.array([start, target])    # to the target: the straight line from where the ball started
+        skip = 0.0
+    errors = tracking_errors(t, x, y, column("reference_x_cm")[on], column("reference_y_cm")[on], path, skip)
+    print(f"  tracking errors after {skip:g} s (shape: {shape}):")
+    for key, value in errors.items():
+        print(f"  {key:22s} {fmt(value)}")
+    result.update(errors)
     return result
 
 

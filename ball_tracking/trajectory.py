@@ -296,28 +296,356 @@ class ReplanningPlanner(TrajectoryPlanner):
         self.replan_count += 1
 
 
+# --------------------------------------------------------------------------- shapes (paths round the target)
+# A shape is drawn round the target (the setpoint is its centre). size is the radius in cm: the distance
+# from the centre to the corners (polygons) or the radius of the circle.
+POLYGONS = {"line": 2, "triangle": 3, "square": 4}
+CONTINUOUS = ("circle", "infinity")
+SHAPES = ["none", "line", "triangle", "square", "circle", "infinity"]
+
+
+def polygon_vertices(shape, size):
+    """Corners of the shape relative to its centre (cm): an array (corners, 2).
+
+    A triangle points towards +y (like the +Y dot of the calibration), the square
+    sits with flat sides along x and y, and the line runs along x.
+    """
+    n = POLYGONS[shape]
+    if shape == "line":
+        return np.array([[size, 0.0], [-size, 0.0]])
+    first = math.pi / 4 if n == 4 else math.pi / 2
+    angles = first + 2 * math.pi * np.arange(n) / n
+    return size * np.column_stack([np.cos(angles), np.sin(angles)])
+
+
+def continuous_reference(shape, size, lap_time, tau):
+    """(position, velocity, acceleration) relative to the centre, tau seconds into a lap of a circle or an infinity sign.
+
+    The circle starts at +x and goes anticlockwise. The infinity sign starts at the centre:
+    x = r sin(w t), y = (r/2) sin(2 w t).
+    """
+    w = 2 * math.pi / lap_time
+    if shape == "circle":
+        c, s = math.cos(w * tau), math.sin(w * tau)
+        return (size * np.array([c, s]), size * w * np.array([-s, c]), -size * w**2 * np.array([c, s]))
+    s1, c1, s2, c2 = math.sin(w * tau), math.cos(w * tau), math.sin(2 * w * tau), math.cos(2 * w * tau)
+    return (np.array([size * s1, size / 2 * s2]), np.array([size * w * c1, size * w * c2]),
+            np.array([-size * w**2 * s1, -2 * size * w**2 * s2]))
+
+
+def shortest_lap_time(shape, size, accel_limit):
+    """Quickest lap the plate can drive: the ball's acceleration is w^2 r (circle) or 2 w^2 r (infinity)."""
+    factor = 1.0 if shape == "circle" else 2.0
+    return 2 * math.pi * math.sqrt(factor * size / accel_limit)
+
+
+def shape_outline(shape, size, points=80):
+    """Points along the whole shape relative to its centre (for drawing it): an array (points, 2)."""
+    if shape in POLYGONS:
+        corners = polygon_vertices(shape, size)
+        return np.vstack([corners, corners[:1]]) if shape != "line" else corners
+    return np.array([continuous_reference(shape, size, 1.0, k / points)[0] for k in range(points + 1)])
+
+
+class ShapePlanner:
+    """Moves the ball round a shape drawn about the target, using one of the three methods for the moves.
+
+    Polygons (line, triangle, square, ...): the ball goes from corner to corner. Each leg is a move with
+    the chosen method (a step to the next corner, a Hermite path to it, or a replanned one), so the ball
+    stops at each corner for a moment. The next leg starts when the path of the leg has finished and the
+    ball is close, or after a time limit so a stuck ball cannot stall the lap.
+
+    Circle and infinity sign: the ball first goes to the start of the shape with the chosen method, then
+    follows a path that is a function of time, over and over. With the step method the reference is just
+    the point where the ball should be now (no reference velocity and no feedforward); with the trajectory
+    methods it also carries the velocity and the acceleration of the path.
+
+    If the ball is knocked more than `lost_distance` off the path it goes back to the first corner / the start.
+    The planner has the same interface as the others, with the target as the centre of the shape.
+    """
+
+    def __init__(self, inner, shape, size=4.0, lap_time=10.0, arrive_distance=1.2, lost_distance=4.0,
+                 accel_limit=DEFAULT_ACCEL_LIMIT):
+        self.inner = inner
+        self.shape = shape
+        self.size = size
+        self.lap_time = lap_time
+        self.arrive_distance = arrive_distance
+        self.lost_distance = lost_distance
+        self.accel_limit = accel_limit
+        self.label = f"{inner.label}, {shape}"
+        self.reset()
+
+    # The controller changes duration / replan_interval on the planner it holds: pass them to the inner one
+    @property
+    def duration(self):
+        return self.inner.duration
+
+    @duration.setter
+    def duration(self, value):
+        self.inner.duration = value
+
+    @property
+    def replan_interval(self):
+        return getattr(self.inner, "replan_interval", None)
+
+    @replan_interval.setter
+    def replan_interval(self, value):
+        if hasattr(self.inner, "replan_interval"):
+            self.inner.replan_interval = value
+
+    def reset(self):
+        self.inner.reset()
+        self.corner = 0               # polygons: the corner the ball is heading for
+        self.leg_start = None
+        self.lap_start = None         # continuous shapes: when the lap began (None while going to the start)
+        self.laps = 0
+        self._acceleration = np.zeros(2)
+
+    # ---- geometry
+    def effective_lap_time(self):
+        """The lap time asked for, lengthened if the plate could not drive it."""
+        if self.shape in CONTINUOUS:
+            return max(self.lap_time, shortest_lap_time(self.shape, self.size, self.accel_limit))
+        return self.lap_time
+
+    def outline(self, center):
+        """The shape drawn about `center`, for the camera view."""
+        return np.asarray(center, dtype=float) + shape_outline(self.shape, self.size)
+
+    # ---- planner interface
+    def reference(self, t, position, velocity, center):
+        center = np.asarray(center, dtype=float)
+        position = np.asarray(position, dtype=float)
+        self._acceleration = np.zeros(2)
+        if self.shape in CONTINUOUS:
+            return self._continuous(t, position, velocity, center)
+        return self._polygon(t, position, velocity, center)
+
+    def _arrived(self, t, position, goal):
+        """Has the leg towards `goal` finished? The path is over and the ball is close, or time ran out."""
+        if self.leg_start is None:
+            return False
+        path_over = t - self.leg_start >= getattr(self.inner, "planned_duration", 0.0)
+        close = np.linalg.norm(position - goal) <= self.arrive_distance
+        if isinstance(self.inner, StepPlanner):
+            path_over = True            # nothing is planned: being close is enough
+        return (path_over and close) or t - self.leg_start > self.inner.duration + 2.0
+
+    def _polygon(self, t, position, velocity, center):
+        corners = polygon_vertices(self.shape, self.size)
+        goal = center + corners[self.corner]
+        if self.leg_start is None:
+            self.leg_start = t
+        reference = self.inner.reference(t, position, velocity, goal)
+        if self._arrived(t, position, goal):
+            self.corner = (self.corner + 1) % len(corners)
+            if self.corner == 0:
+                self.laps += 1
+            self.leg_start = t
+        return reference
+
+    def _continuous(self, t, position, velocity, center):
+        start = center + continuous_reference(self.shape, self.size, 1.0, 0.0)[0]
+        if self.lap_start is None:                       # going to the start of the shape
+            if self.leg_start is None:
+                self.leg_start = t
+            reference = self.inner.reference(t, position, velocity, start)
+            if self._arrived(t, position, start):
+                self.lap_start = t
+            return reference
+        lap = self.effective_lap_time()
+        tau = t - self.lap_start
+        self.laps = int(tau // lap)
+        p, v, a = continuous_reference(self.shape, self.size, lap, tau)
+        p = center + p
+        if np.linalg.norm(position - p) > self.lost_distance:   # knocked off, or fell behind: start again
+            self.inner.reset()
+            self.leg_start = None
+            self.lap_start = None
+            return self._continuous(t, position, velocity, center)
+        if isinstance(self.inner, StepPlanner):
+            return p, np.zeros(2)
+        self._acceleration = a
+        return p, v
+
+    def acceleration(self, t):
+        if self.shape in CONTINUOUS and self.lap_start is not None:
+            return self._acceleration
+        return self.inner.acceleration(t)
+
+
+class CenterPlanner:
+    """Method (d): go straight to the target at a cruise speed, slowing down smoothly as it gets close.
+
+    The path is a straight line from where the ball is to the target. Along it the speed asked for is
+        speed = min(cruise_speed, distance_left / tau),   tau = slow_distance / cruise_speed
+    so the ball cruises until it is slow_distance from the target, then its speed falls in proportion to
+    the distance left (an exponential approach, like a car easing off the gas): fast far away, gentle at
+    the end, and it never arrives with a bump. The actual speed follows that asked-for speed with the
+    plate's acceleration limit, so the start (from rest or from a moving ball) and the braking are smooth.
+
+    The profile is worked out when the move starts (and again if the target changes). It is replanned from
+    the measured ball position and velocity only when the ball gets further than `replan_error` from where the
+    plan says it should be (a knock, a slip, a bad start), never on a timer; `replan_gap` is the shortest
+    time between two replans, so noise and lag cannot make it chatter. replan_error = 0 turns replanning off.
+    After the plan ends the reference holds at the target (and a ball knocked away from it is replanned too).
+    """
+    label = "Trajectory to centre"
+
+    def __init__(self, cruise_speed=8.0, slow_distance=4.0, accel_limit=DEFAULT_ACCEL_LIMIT, replan_error=0.0,
+                 replan_gap=1.0):
+        self.cruise_speed = cruise_speed        # cm/s
+        self.slow_distance = slow_distance      # cm from the target where the slowing down starts
+        self.replan_error = replan_error        # cm: replan when the ball is this far off the plan (0 = never)
+        self.replan_gap = replan_gap            # s, at least this long between replans
+        self.accel_limit = accel_limit
+        self.duration = 3.0                     # unused here (the speed sets the time); kept so the controller can set it
+        self.reset()
+
+    def reset(self):
+        self.start_time = None
+        self.target = None
+        self.planned_duration = 0.0
+        self.replan_count = 0
+        self.last_plan_time = None
+
+    def reference(self, t, position, velocity, target):
+        target = np.asarray(target, dtype=float)
+        position = np.asarray(position, dtype=float)
+        velocity = np.asarray(velocity, dtype=float)
+        if self.start_time is None or not np.allclose(target, self.target):
+            self.replan_count = 0
+            self._plan(t, position, velocity, target)
+        elif (self.replan_error > 0 and t - self.last_plan_time >= self.replan_gap
+              and np.linalg.norm(position - self._evaluate(t)[0]) > self.replan_error):
+            self.replan_count += 1
+            self._plan(t, position, velocity, target)    # off the plan: plan again from where the ball is
+        return self._evaluate(t)
+
+    def _plan(self, t, position, velocity, target):
+        self.start_time = t
+        self.last_plan_time = t
+        self.target = target
+        gap = position - target                       # from the target back to the ball
+        distance = float(np.linalg.norm(gap))
+        self.start_position = position
+        if distance < 0.05:                           # already there
+            self.direction = np.zeros(2)
+            self.times = np.array([0.0, 1.0])
+            self.left = np.zeros(2)
+            self.speeds = np.zeros(2)
+            self.planned_duration = 0.0
+            return
+        self.direction = -gap / distance              # unit vector towards the target
+        cruise = max(self.cruise_speed, 0.5)
+        tau = max(self.slow_distance, 0.5) / cruise
+        speed = float(velocity @ self.direction)      # the ball's speed towards the target now
+        step = 0.01
+        times, left, speeds = [0.0], [distance], [speed]
+        r = distance
+        while r > 0.05 and times[-1] < 20.0:
+            wanted = min(cruise, r / tau)
+            # follow the asked-for speed, no faster than the plate can change it
+            speed += float(np.clip(wanted - speed, -self.accel_limit * step, self.accel_limit * step))
+            r -= speed * step
+            r = min(r, self.edge_distance(distance))
+            times.append(times[-1] + step)
+            left.append(max(r, 0.0))
+            speeds.append(speed)
+        self.times = np.array(times)
+        self.left = np.array(left)
+        self.speeds = np.array(speeds)
+        self.planned_duration = float(self.times[-1])
+
+    @staticmethod
+    def edge_distance(distance):
+        """Never let the ball be asked to go further from the target than 1.5x where it started."""
+        return 1.5 * distance + 1.0
+
+    def _evaluate(self, t):
+        if not np.any(self.direction):
+            return self.target.copy(), np.zeros(2)
+        tau = t - self.start_time
+        if tau >= self.times[-1]:
+            return self.target.copy(), np.zeros(2)
+        r = float(np.interp(tau, self.times, self.left))
+        speed = float(np.interp(tau, self.times, self.speeds))
+        return self.target - self.direction * r, self.direction * speed
+
+    def acceleration(self, t):
+        """Acceleration of the planned path at time t (for feedforward)."""
+        if self.start_time is None or not np.any(self.direction):
+            return np.zeros(2)
+        tau = t - self.start_time
+        if tau <= 0 or tau >= self.times[-1] - 0.02:
+            return np.zeros(2)
+        i = int(np.searchsorted(self.times, tau))
+        i = min(max(i, 1), len(self.times) - 1)
+        return self.direction * float((self.speeds[i] - self.speeds[i - 1]) / (self.times[i] - self.times[i - 1]))
+
+
 METHODS = {
     "step": StepPlanner,
     "trajectory": TrajectoryPlanner,
     "update": ReplanningPlanner,
+    "center": CenterPlanner,
 }
 
 
+def relevant_settings(method, shape="none"):
+    """Names of the planner settings that change anything for this method and shape (for the GUIs to show only those).
+
+    Names: duration, replan_interval, feedforward, cruise_speed, slow_distance, replan_error, size, lap_time.
+    """
+    names = set()
+    if method in ("trajectory", "update"):
+        names.add("duration")
+    if method == "update":
+        names.add("replan_interval")
+    if method != "step":
+        names.add("feedforward")          # the step method plans no acceleration to feed forward
+    if method == "center":
+        names |= {"cruise_speed", "slow_distance", "replan_error"}
+    if shape != "none":
+        names.add("size")
+    if shape in CONTINUOUS:
+        names.add("lap_time")
+    return names
+
+
 def make_planner(method, **settings):
-    """Planner for "step", "trajectory" or "update".
+    """Planner for "step", "trajectory", "update" or "center" (slows down on the way to the target).
 
     Settings (all optional): duration, replan_interval, accel_limit, edge_limit, and for "update" also
-    final_approach, restart_distance and trigger.
+    final_approach, restart_distance and trigger; for "center" cruise_speed (cm/s), slow_distance (cm) and replan_error (cm, 0 = never replan).
+
+    shape ("none", "line", "triangle", "square", "circle", "infinity"), size (cm) and
+    lap_time (s, circle and infinity) make the ball go round a shape centred on the target instead of
+    stopping at the target. "none" is the original behaviour.
     """
-    if method == "step":
-        return StepPlanner()
+    shape = settings.get("shape", "none")
+    if shape not in SHAPES:
+        raise ValueError(f"shape must be one of {SHAPES}")
     limits = {"accel_limit": settings.get("accel_limit", DEFAULT_ACCEL_LIMIT),
               "edge_limit": settings.get("edge_limit", DEFAULT_EDGE_LIMIT)}
-    if method == "trajectory":
-        return TrajectoryPlanner(settings.get("duration", 3.0), **limits)
-    if method == "update":
-        return ReplanningPlanner(settings.get("duration", 3.0), settings.get("replan_interval", 0.5), **limits,
-                                 final_approach=settings.get("final_approach", 0.5),
-                                 restart_distance=settings.get("restart_distance", 3.0),
-                                 trigger=settings.get("trigger", 0.0))
-    raise ValueError(f"method must be one of {sorted(METHODS)}")
+    if method == "step":
+        planner = StepPlanner()
+        planner.duration = settings.get("duration", 3.0)    # only used as the time limit of a leg of a shape
+    elif method == "trajectory":
+        planner = TrajectoryPlanner(settings.get("duration", 3.0), **limits)
+    elif method == "center":
+        planner = CenterPlanner(settings.get("cruise_speed", 8.0), settings.get("slow_distance", 4.0),
+                                limits["accel_limit"], settings.get("replan_error", 0.0),
+                                settings.get("replan_gap", 1.0))
+    elif method == "update":
+        planner = ReplanningPlanner(settings.get("duration", 3.0), settings.get("replan_interval", 0.5), **limits,
+                                    final_approach=settings.get("final_approach", 0.5),
+                                    restart_distance=settings.get("restart_distance", 3.0),
+                                    trigger=settings.get("trigger", 0.0))
+    else:
+        raise ValueError(f"method must be one of {sorted(METHODS)}")
+    if shape == "none":
+        return planner
+    return ShapePlanner(planner, shape, settings.get("size", 4.0), settings.get("lap_time", 10.0),
+                        accel_limit=limits["accel_limit"])
